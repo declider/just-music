@@ -1,0 +1,30 @@
+[package]
+name = "just_music"
+version = "0.1.0"
+edition = "2024"
+description = "Small, fast, no-nonsense music player for Windows"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+rodio = { version = "0.23", default-features = false, features = [
+    "playback",
+    "flac",
+    "mp3",
+    "mp4",
+    "vorbis",
+    "wav",
+] }
+lofty = "0.25"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+rfd = "0.18"
+tray-icon = "0.26"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
