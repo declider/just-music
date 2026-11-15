@@ -1,102 +1,1536 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(clippy::field_reassign_with_default)]
 
+//! Just Music — a small native Win32 music player.
+
+mod library;
 mod player;
 
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::Arc,
+    ffi::c_void,
+    path::PathBuf,
+    ptr::null_mut,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
     time::Duration,
 };
 
-use eframe::egui::{
-    self, Align2, Color32, FontId, Rect, RichText, Sense, ThemePreference, Vec2, pos2, vec2,
-};
-use lofty::{
-    file::{AudioFile, TaggedFileExt},
-    tag::Accessor,
-};
+use library::{Settings, Track};
 use player::Audio;
-use tray_icon::{
-    TrayIcon, TrayIconBuilder,
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+
+use windows::{
+    Win32::{
+        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
+            CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC,
+            CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
+            DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+            DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
+            EndPaint, FillRect, GetStockObject, HALFTONE, HBRUSH, HDC, HFONT, HGDIOBJ,
+            InvalidateRect, NULL_PEN, OUT_TT_PRECIS, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject,
+            SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
+            TRANSPARENT, UpdateWindow,
+        },
+        Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext},
+            Input::KeyboardAndMouse::{GetFocus, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE, VK_UP},
+            Shell::{
+                NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+                NOTIFYICONDATAW, NOTIFYICON_VERSION_4, Shell_NotifyIconW,
+            },
+            WindowsAndMessaging::*,
+        },
+    },
+    core::PCWSTR,
 };
 
-const AUDIO_EXT: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "mp4"];
-const ROW_H: f32 = 26.0;
-const ACCENT: Color32 = Color32::from_rgb(96, 165, 255);
+// ---------------------------------------------------------------- drawing bits
 
-fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([360.0, 520.0])
-            .with_min_inner_size([300.0, 360.0])
-            .with_title("Just Music")
-            .with_icon(Arc::new(app_icon_data())),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Just Music",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+const BG: COLORREF = COLORREF(0x0018_1414); // #141418
+const PANEL: COLORREF = COLORREF(0x0021_1c1c); // #1c1c21
+const TEXT: COLORREF = COLORREF(0x00ec_ece8); // #e8ecec
+const DIM: COLORREF = COLORREF(0x00a0_9a96); // #969aa0
+const ACCENT: COLORREF = COLORREF(0x00ff_a05a); // #5aa0ff  (BGR)
+const HOVER: COLORREF = COLORREF(0x0030_2a26); // #262a30
+const SEL: COLORREF = COLORREF(0x004a_3226); // #26324a
+const TRACK_BG: COLORREF = COLORREF(0x0044_3a3a); // #3a3a44
+
+const ERROR_RED: COLORREF = COLORREF(0x0068_7cff);
+const WM_TRAY: u32 = WM_APP + 1;
+const TIMER_ID: usize = 1;
+
+const CMD_PLAY: usize = 100;
+const CMD_PREV: usize = 101;
+const CMD_NEXT: usize = 102;
+const CMD_SHOW: usize = 103;
+const CMD_HIDE: usize = 104;
+const CMD_EXIT: usize = 105;
+
+const CMD_QUEUE_NEXT: usize = 200;
+const CMD_QUEUE_ADD: usize = 201;
+const CMD_QUEUE_CLEAR: usize = 202;
+
+const EM_SETCUEBANNER: u32 = 0x1501;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EN_CHANGE_CODE: u32 = 0x0300;
+
+struct Fonts {
+    ui: HFONT,
+    bold: HFONT,
+    small: HFONT,
+    icons: HFONT,
 }
 
-// ---------------------------------------------------------------- library
-
-struct Track {
-    path: PathBuf,
-    title: String,
-    artist: String,
-    duration: f64,
-}
-
-fn read_track(path: PathBuf) -> Track {
-    let mut title = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let mut artist = String::new();
-    let mut duration = 0.0;
-
-    if let Ok(file) = lofty::read_from_path(&path) {
-        duration = file.properties().duration().as_secs_f64();
-        if let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) {
-            if let Some(t) = tag.title() {
-                title = t.to_string();
-            }
-            if let Some(a) = tag.artist() {
-                artist = a.to_string();
-            }
+impl Fonts {
+    unsafe fn new(dpi: i32) -> Self {
+        let h = |pt: i32| -(pt * dpi / 72);
+        let make = |pt: i32, weight: i32, face: PCWSTR| unsafe {
+            CreateFontW(
+                h(pt),
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                OUT_TT_PRECIS,
+                CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY,
+                DEFAULT_PITCH.0 as u32,
+                face,
+            )
+        };
+        Self {
+            ui: make(9, 400, w_ptr("Segoe UI")),
+            bold: make(9, 600, w_ptr("Segoe UI")),
+            small: make(8, 400, w_ptr("Segoe UI")),
+            icons: make(11, 400, w_ptr("Segoe MDL2 Assets")),
         }
     }
-
-    Track {
-        path,
-        title,
-        artist,
-        duration,
-    }
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<Track>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn w_ptr(s: &str) -> PCWSTR {
+    // Small static-ish strings; leaked so the PCWSTR stays valid.
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    PCWSTR(Box::leak(wide.into_boxed_slice()).as_ptr())
+}
+
+unsafe fn fill(hdc: HDC, r: RECT, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    FillRect(hdc, &r, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+unsafe fn round_fill(hdc: HDC, r: RECT, color: COLORREF, radius: i32) {
+    let brush = CreateSolidBrush(color);
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = RoundRect(hdc, r.left, r.top, r.right, r.bottom, radius * 2, radius * 2);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+unsafe fn draw_text(hdc: HDC, r: RECT, text: &str, font: HFONT, color: COLORREF, flags: DRAW_TEXT_FORMAT) {
+    if text.is_empty() {
         return;
+    }
+    let mut buf: Vec<u16> = text.encode_utf16().collect();
+    let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+    SetTextColor(hdc, color);
+    SetBkMode(hdc, TRANSPARENT);
+    let mut rc = r;
+    DrawTextW(hdc, &mut buf, &mut rc, flags | DT_NOPREFIX);
+    SelectObject(hdc, old_font);
+}
+
+unsafe fn draw_glyph(hdc: HDC, r: RECT, glyph: &str, font: HFONT, color: COLORREF) {
+    draw_text(hdc, r, glyph, font, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+}
+
+/// Folder silhouette for the "open folder" button (no MDL2 glyph needed).
+unsafe fn draw_folder(hdc: HDC, r: RECT, hot: bool, s: f32) {
+    let color = if hot { TEXT } else { DIM };
+    let w = (14.0 * s) as i32;
+    let h = (11.0 * s) as i32;
+    let left = (r.left + r.right - w) / 2;
+    let top = (r.top + r.bottom - h) / 2;
+    fill(hdc, rect(left, top, left + w / 2, top + (4.0 * s) as i32), color);
+    round_fill(hdc, rect(left, top + (3.0 * s) as i32, left + w, top + h), color, (2.0 * s) as i32);
+}
+
+unsafe fn draw_bar(hdc: HDC, r: RECT, frac: f32, hot: bool, scale: f32) {
+    let center = (r.top + r.bottom) / 2;
+    let h = ((if hot { 6.0 } else { 4.0 }) * scale) as i32;
+    let track = RECT {
+        left: r.left,
+        top: center - h / 2,
+        right: r.right,
+        bottom: center + h / 2 + 1,
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_dir(&path, out);
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext = ext.to_ascii_lowercase();
-            if AUDIO_EXT.contains(&ext.as_str()) {
-                out.push(read_track(path));
+    round_fill(hdc, track, TRACK_BG, h / 2);
+
+    let frac = frac.clamp(0.0, 1.0);
+    let right = r.left + ((r.right - r.left) as f32 * frac) as i32;
+    if right > r.left {
+        let done = RECT {
+            right,
+            ..track
+        };
+        round_fill(hdc, done, ACCENT, h / 2);
+    }
+
+    let knob = (5.0 * scale) as i32;
+    let brush = CreateSolidBrush(if hot { COLORREF(0x0000_0000) } else { ACCENT });
+    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = Ellipse(hdc, right - knob, center - knob, right + knob, center + knob);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+// ---------------------------------------------------------------- layout
+
+#[derive(Clone, Copy)]
+struct Layout {
+    search: RECT,
+    open: RECT,
+    shuffle: RECT,
+    list: RECT,
+    cover: RECT,
+    seek: RECT,
+    cur_time: RECT,
+    tot_time: RECT,
+    prev: RECT,
+    play: RECT,
+    next: RECT,
+    vol_icon: RECT,
+    vol_bar: RECT,
+    vol_pct: RECT,
+    min_btn: RECT,
+    status: RECT,
+    row_h: i32,
+    scrollbar: i32,
+}
+
+fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
+    RECT {
+        left: l,
+        top: t,
+        right: r,
+        bottom: b,
+    }
+}
+
+impl Layout {
+    fn compute(w: i32, h: i32, scale: f32) -> Self {
+        let s = |v: f32| (v * scale) as i32;
+        let pad = s(10.0);
+        let btn = s(26.0);
+        let ctrl_h = s(30.0);
+        let seek_h = s(18.0);
+        let info_h = s(46.0);
+        let status_h = s(15.0);
+        let row_h = s(26.0);
+
+        let open = rect(pad, pad, pad + btn, pad + btn);
+        let shuffle = rect(w - pad - btn, pad, w - pad, pad + btn);
+        let search = rect(
+            open.right + s(8.0),
+            pad,
+            shuffle.left - s(8.0),
+            pad + btn,
+        );
+
+        let list_top = pad + btn + s(8.0);
+        let bottom_h = status_h + ctrl_h + seek_h + info_h + s(10.0);
+        let bottom_top = h - bottom_h;
+
+        let cover = rect(pad, bottom_top + s(2.0), pad + info_h - s(2.0), bottom_top + info_h);
+
+        let seek_y = bottom_top + info_h + s(4.0);
+        let cur_time = rect(pad, seek_y, pad + s(38.0), seek_y + seek_h);
+        let tot_time = rect(w - pad - s(38.0), seek_y, w - pad, seek_y + seek_h);
+        let seek = rect(
+            cur_time.right + s(6.0),
+            seek_y,
+            tot_time.left - s(6.0),
+            seek_y + seek_h,
+        );
+
+        let ctrl_y = seek_y + seek_h + s(2.0);
+        let prev = rect(pad, ctrl_y, pad + ctrl_h, ctrl_y + ctrl_h);
+        let play = rect(
+            prev.right + s(8.0),
+            ctrl_y,
+            prev.right + s(8.0) + ctrl_h,
+            ctrl_y + ctrl_h,
+        );
+        let next = rect(
+            play.right + s(8.0),
+            ctrl_y,
+            play.right + s(8.0) + ctrl_h,
+            ctrl_y + ctrl_h,
+        );
+
+        let min_btn = rect(
+            w - pad - btn,
+            ctrl_y + (ctrl_h - btn) / 2,
+            w - pad,
+            ctrl_y + (ctrl_h - btn) / 2 + btn,
+        );
+        let vol_pct = rect(min_btn.left - s(40.0), ctrl_y, min_btn.left - s(6.0), ctrl_y + ctrl_h);
+        let vol_bar = rect(vol_pct.left - s(92.0), ctrl_y, vol_pct.left - s(8.0), ctrl_y + ctrl_h);
+        let vol_icon = rect(vol_bar.left - s(20.0), ctrl_y, vol_bar.left - s(4.0), ctrl_y + ctrl_h);
+
+        Self {
+            search,
+            open,
+            shuffle,
+            list: rect(pad, list_top, w - pad, (bottom_top - s(6.0)).max(list_top + row_h)),
+            cover,
+            seek,
+            cur_time,
+            tot_time,
+            prev,
+            play,
+            next,
+            vol_icon,
+            vol_bar,
+            vol_pct,
+            min_btn,
+            status: rect(pad, h - status_h - s(2.0), w - pad, h - s(2.0)),
+            row_h,
+            scrollbar: s(8.0),
+        }
+    }
+}
+
+fn inside(r: RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+// ---------------------------------------------------------------- app state
+
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    Open,
+    Shuffle,
+    Prev,
+    Play,
+    Next,
+    Minimize,
+    Seek,
+    Volume,
+    Scroll,
+    Row(usize),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    None,
+    Seek,
+    Volume,
+}
+
+struct Scan {
+    rx: Receiver<Vec<Track>>,
+    count: Arc<AtomicUsize>,
+}
+
+struct Cover {
+    bmp: windows::Win32::Graphics::Gdi::HBITMAP,
+    w: i32,
+    h: i32,
+}
+
+struct App {
+    hwnd: HWND,
+    edit: HWND,
+    icon: HICON,
+    fonts: Fonts,
+    brush_input: HBRUSH,
+
+    audio: Option<Audio>,
+    error: Option<String>,
+
+    tracks: Vec<Track>,
+    visible: Vec<usize>,
+    search: String,
+    folder: Option<PathBuf>,
+
+    current: Option<usize>,
+    playing: bool,
+    pos: f64,
+    volume: f32,
+    shuffle: bool,
+    queue: VecDeque<usize>,
+    scroll: usize,
+    drag: Drag,
+
+    hover: Option<Hit>,
+    scan: Option<Scan>,
+    scan_count: usize,
+    anim: u32,
+
+    cover: Option<Cover>,
+    rng: u64,
+    dpi_scale: f32,
+
+    tray: bool,
+    tray_tip: String,
+}
+
+impl App {
+    unsafe fn new(hwnd: HWND) -> Self {
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+        let dark = windows::core::BOOL::from(true);
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark as *const _ as *const c_void,
+                std::mem::size_of::<windows::core::BOOL>() as u32,
+            );
+        }
+        let settings = Settings::load();
+
+        let mut app = Self {
+            hwnd,
+            edit: HWND::default(),
+            icon: HICON::default(),
+            fonts: unsafe { Fonts::new((96.0 * dpi) as i32) },
+            brush_input: unsafe { CreateSolidBrush(PANEL) },
+            audio: Audio::open().ok(),
+            error: None,
+            tracks: Vec::new(),
+            visible: Vec::new(),
+            search: String::new(),
+            folder: None,
+            current: None,
+            playing: false,
+            pos: 0.0,
+            volume: settings.volume,
+            shuffle: settings.shuffle,
+            queue: VecDeque::new(),
+            scroll: 0,
+            drag: Drag::None,
+            hover: None,
+            scan: None,
+            scan_count: 0,
+            anim: 0,
+            cover: None,
+            rng: seed(),
+            dpi_scale: dpi,
+            tray: false,
+            tray_tip: String::new(),
+        };
+
+        if let Some(audio) = &app.audio {
+            audio.set_volume(app.volume);
+        }
+
+        unsafe {
+            app.icon = make_icon();
+            if !app.icon.is_invalid() {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(app.icon.0 as isize)),
+                );
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(app.icon.0 as isize)),
+                );
+            }
+            app.create_edit(hwnd);
+            app.init_tray(hwnd);
+        }
+
+        let startup = std::env::args()
+            .nth(1)
+            .map(PathBuf::from)
+            .or(settings.folder);
+        if let Some(dir) = startup {
+            if dir.is_dir() {
+                app.load_folder(dir);
+            }
+        } else {
+            app.save_settings();
+        }
+
+        app
+    }
+
+    unsafe fn create_edit(&mut self, hwnd: HWND) {
+        let style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32);
+        let Ok(edit) = (unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w_ptr("EDIT"),
+                w_ptr(""),
+                style,
+                0,
+                0,
+                10,
+                10,
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )
+        }) else {
+            return;
+        };
+        self.edit = edit;
+        unsafe {
+            SendMessageW(edit, WM_SETFONT, Some(WPARAM(self.fonts.ui.0 as isize as usize)), Some(LPARAM(1)));
+            SendMessageW(
+                edit,
+                EM_SETCUEBANNER,
+                Some(WPARAM(1)),
+                Some(LPARAM(w_ptr("Search title or artist").0 as isize)),
+            );
+            SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(256)), Some(LPARAM(0)));
+        }
+    }
+
+    unsafe fn init_tray(&mut self, hwnd: HWND) {
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.uCallbackMessage = WM_TRAY;
+        nid.hIcon = self.icon;
+        set_tip(&mut nid.szTip, "Just Music");
+        unsafe {
+            if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+                self.tray = true;
+                nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+                let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            }
+        }
+    }
+
+    unsafe fn remove_tray(&mut self) {
+        if !self.tray {
+            return;
+        }
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = 1;
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+        self.tray = false;
+    }
+
+    fn scale(&self) -> f32 {
+        self.dpi_scale
+    }
+
+    fn layout(&self) -> Layout {
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        Layout::compute(rc.right, rc.bottom, self.scale())
+    }
+
+    fn invalidate(&self) {
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    fn save_settings(&self) {
+        Settings {
+            folder: self.folder.clone(),
+            volume: self.volume,
+            shuffle: self.shuffle,
+        }
+        .save();
+    }
+
+    // ------------------------------------------------ library / playback
+
+    fn load_folder(&mut self, dir: PathBuf) {
+        self.folder = Some(dir.clone());
+        self.tracks.clear();
+        self.visible.clear();
+        self.scroll = 0;
+        self.current = None;
+        self.playing = false;
+        self.pos = 0.0;
+        self.queue.clear();
+        if let Some(audio) = &self.audio {
+            audio.stop();
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let count = Arc::new(AtomicUsize::new(0));
+        let thread_count = count.clone();
+        std::thread::spawn(move || {
+            let mut tracks = Vec::new();
+            library::scan(&dir, &mut tracks, &thread_count);
+            tracks.sort_by(|a, b| {
+                a.title
+                    .to_lowercase()
+                    .cmp(&b.title.to_lowercase())
+                    .then_with(|| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()))
+            });
+            let _ = tx.send(tracks);
+        });
+        self.scan = Some(Scan { rx, count });
+        self.scan_count = 0;
+        self.save_settings();
+        self.invalidate();
+    }
+
+    fn poll_scan(&mut self) {
+        let Some(scan) = &self.scan else {
+            return;
+        };
+        match scan.rx.try_recv() {
+            Ok(tracks) => {
+                self.tracks = tracks;
+                self.scan = None;
+                self.scan_count = self.tracks.len();
+                self.refilter();
+                self.invalidate();
+            }
+            Err(TryRecvError::Empty) => {
+                self.scan_count = scan.count.load(Ordering::Relaxed);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.scan = None;
+            }
+        }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.search.trim().to_lowercase();
+        self.visible = if q.is_empty() {
+            (0..self.tracks.len()).collect()
+        } else {
+            self.tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    t.title.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        self.scroll = 0;
+    }
+
+    fn play_index(&mut self, idx: usize) {
+        let Some(track) = self.tracks.get(idx) else {
+            return;
+        };
+        let path = track.path.clone();
+        let title = track.title.clone();
+        let artist = track.artist.clone();
+
+        let Some(audio) = &self.audio else {
+            self.error = Some("No audio output device".into());
+            return;
+        };
+        match audio.play(&path, self.volume) {
+            Ok(()) => {
+                self.current = Some(idx);
+                self.pos = 0.0;
+                self.playing = true;
+                self.error = None;
+                unsafe {
+                    self.load_cover();
+                }
+                self.scroll_to_current();
+                unsafe {
+                    let text = if artist.is_empty() {
+                        format!("{title} — Just Music")
+                    } else {
+                        format!("{title} — {artist} — Just Music")
+                    };
+                    let _ = SetWindowTextW(self.hwnd, &windows::core::HSTRING::from(text));
+                }
+            }
+            Err(e) => {
+                self.current = None;
+                self.playing = false;
+                self.error = Some(format!("{title}: {e}"));
+            }
+        }
+        self.invalidate();
+    }
+
+    fn next_track(&mut self, wrap: bool) {
+        let idx = if let Some(i) = self.queue.pop_front() {
+            Some(i)
+        } else if self.shuffle && self.current.is_some() {
+            Some(shuffled_next(
+                self.tracks.len(),
+                self.current.unwrap_or(0),
+                self.rng_next(),
+            ))
+        } else {
+            sequential_next(self.tracks.len(), self.current, wrap)
+        };
+        match idx {
+            Some(i) => self.play_index(i),
+            None => {
+                if let Some(audio) = &self.audio {
+                    audio.stop();
+                }
+                self.playing = false;
+                self.pos = 0.0;
+                self.invalidate();
+            }
+        }
+    }
+
+    fn prev_track(&mut self) {
+        if self.pos > 3.0 {
+            self.seek_to(0.0);
+            return;
+        }
+        let len = self.tracks.len();
+        if len == 0 {
+            return;
+        }
+        let idx = match self.current {
+            Some(0) | None => len - 1,
+            Some(c) => c - 1,
+        };
+        self.play_index(idx);
+    }
+
+    fn toggle_play(&mut self) {
+        let Some(audio) = &self.audio else {
+            return;
+        };
+        let finished = audio.finished();
+        if self.current.is_none() || finished {
+            if !self.tracks.is_empty() {
+                self.next_track(true);
+            }
+            return;
+        }
+        if audio.is_paused() {
+            audio.resume();
+        } else {
+            audio.pause();
+        }
+        self.playing = !audio.is_paused();
+        self.invalidate();
+    }
+
+    fn seek_to(&mut self, secs: f64) {
+        self.pos = secs;
+        if let Some(audio) = &self.audio {
+            audio.seek(Duration::from_secs_f64(secs.max(0.0)));
+        }
+        self.invalidate();
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        if let Some(audio) = &self.audio {
+            audio.set_volume(self.volume);
+        }
+        self.invalidate();
+    }
+
+    fn current_duration(&self) -> f64 {
+        self.current
+            .and_then(|i| self.tracks.get(i))
+            .map(|t| t.duration)
+            .unwrap_or(0.0)
+    }
+
+    fn scroll_to_current(&mut self) {
+        let Some(cur) = self.current else {
+            return;
+        };
+        let Some(pos) = self.visible.iter().position(|&i| i == cur) else {
+            return;
+        };
+        let l = self.layout();
+        let rows = ((l.list.bottom - l.list.top) / l.row_h).max(1) as usize;
+        if pos < self.scroll {
+            self.scroll = pos;
+        } else if pos >= self.scroll + rows {
+            self.scroll = pos + 1 - rows;
+        }
+    }
+
+    fn rng_next(&mut self) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        x
+    }
+
+    unsafe fn load_cover(&mut self) {
+        if let Some(old) = self.cover.take() {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(old.bmp.0));
+            }
+        }
+        let Some(track) = self.current.and_then(|i| self.tracks.get(i)) else {
+            return;
+        };
+        let Some((rgba, w, h)) = library::cover_rgba(&track.path) else {
+            return;
+        };
+
+        unsafe {
+            let mut bmi = BITMAPINFO::default();
+            bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w as i32;
+            bmi.bmiHeader.biHeight = -(h as i32);
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB.0;
+
+            let mut bits: *mut c_void = null_mut();
+            let Ok(bmp) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+                return;
+            };
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), bits as *mut u8, rgba.len());
+            self.cover = Some(Cover {
+                bmp,
+                w: w as i32,
+                h: h as i32,
+            });
+        }
+    }
+
+    fn tick(&mut self) {
+        self.anim = self.anim.wrapping_add(1);
+        self.poll_scan();
+
+        let finished = self.current.is_some() && self.audio.as_ref().is_some_and(|a| a.finished());
+        if finished {
+            self.next_track(false);
+            return;
+        }
+        if let Some(audio) = &self.audio {
+            if self.current.is_some() {
+                self.pos = audio.position().as_secs_f64();
+            }
+            self.playing = self.current.is_some() && !audio.is_paused();
+        }
+
+        let tip = match self.current.and_then(|i| self.tracks.get(i)) {
+            Some(t) if t.artist.is_empty() => t.title.clone(),
+            Some(t) => format!("{} — {}", t.artist, t.title),
+            None => String::new(),
+        };
+        if tip != self.tray_tip {
+            self.tray_tip = tip;
+            unsafe {
+                self.update_tray_tip();
+            }
+        }
+
+        unsafe {
+            if IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
+    }
+
+    unsafe fn update_tray_tip(&self) {
+        if !self.tray {
+            return;
+        }
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_TIP;
+        let tip = if self.tray_tip.is_empty() {
+            "Just Music".to_string()
+        } else {
+            self.tray_tip.clone()
+        };
+        set_tip(&mut nid.szTip, &tip);
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    // ------------------------------------------------ input
+
+    fn hit_test(&self, x: i32, y: i32) -> Option<Hit> {
+        let l = self.layout();
+        if inside(l.open, x, y) {
+            return Some(Hit::Open);
+        }
+        if inside(l.shuffle, x, y) {
+            return Some(Hit::Shuffle);
+        }
+        if inside(l.prev, x, y) {
+            return Some(Hit::Prev);
+        }
+        if inside(l.play, x, y) {
+            return Some(Hit::Play);
+        }
+        if inside(l.next, x, y) {
+            return Some(Hit::Next);
+        }
+        if inside(l.min_btn, x, y) {
+            return Some(Hit::Minimize);
+        }
+        if inside(l.seek, x, y) {
+            return Some(Hit::Seek);
+        }
+        if inside(l.vol_bar, x, y) {
+            return Some(Hit::Volume);
+        }
+        if inside(l.list, x, y) {
+            if x >= l.list.right - l.scrollbar {
+                return Some(Hit::Scroll);
+            }
+            let row = self.scroll + ((y - l.list.top) / l.row_h) as usize;
+            if row < self.visible.len() {
+                return Some(Hit::Row(row));
+            }
+        }
+        None
+    }
+
+    fn seek_from_x(&mut self, x: i32) {
+        let l = self.layout();
+        let width = (l.seek.right - l.seek.left).max(1);
+        let frac = ((x - l.seek.left) as f32 / width as f32).clamp(0.0, 1.0);
+        let dur = self.current_duration();
+        self.pos = (dur * frac as f64).clamp(0.0, dur);
+        self.invalidate();
+    }
+
+    fn volume_from_x(&mut self, x: i32) {
+        let l = self.layout();
+        let width = (l.vol_bar.right - l.vol_bar.left).max(1);
+        let frac = ((x - l.vol_bar.left) as f32 / width as f32).clamp(0.0, 1.0);
+        self.set_volume(frac);
+    }
+
+    fn scroll_from_y(&mut self, y: i32) {
+        let l = self.layout();
+        let rows = ((l.list.bottom - l.list.top) / l.row_h).max(1) as usize;
+        let total = self.visible.len();
+        let max_scroll = total.saturating_sub(rows);
+        if max_scroll == 0 {
+            return;
+        }
+        let height = (l.list.bottom - l.list.top).max(1);
+        let frac = ((y - l.list.top) as f32 / height as f32).clamp(0.0, 1.0);
+        self.scroll = (frac * max_scroll as f32) as usize;
+        self.invalidate();
+    }
+
+    fn on_mouse_move(&mut self, x: i32, y: i32) {
+        match self.drag {
+            Drag::Seek => {
+                self.seek_from_x(x);
+                return;
+            }
+            Drag::Volume => {
+                self.volume_from_x(x);
+                return;
+            }
+            Drag::None => {}
+        }
+        let hit = self.hit_test(x, y);
+        if hit != self.hover {
+            self.hover = hit;
+            self.invalidate();
+        }
+    }
+
+    fn on_mouse_down(&mut self, x: i32, y: i32) {
+        match self.hit_test(x, y) {
+            Some(Hit::Open) => {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.load_folder(dir);
+                }
+            }
+            Some(Hit::Shuffle) => {
+                self.shuffle = !self.shuffle;
+                self.save_settings();
+                self.invalidate();
+            }
+            Some(Hit::Prev) => self.prev_track(),
+            Some(Hit::Play) => self.toggle_play(),
+            Some(Hit::Next) => self.next_track(true),
+            Some(Hit::Minimize) => unsafe {
+                let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+            },
+            Some(Hit::Seek) => {
+                self.drag = Drag::Seek;
+                self.seek_from_x(x);
+            }
+            Some(Hit::Volume) => {
+                self.drag = Drag::Volume;
+                self.volume_from_x(x);
+            }
+            Some(Hit::Scroll) => self.scroll_from_y(y),
+            Some(Hit::Row(row)) => {
+                if let Some(&idx) = self.visible.get(row) {
+                    self.play_index(idx);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn on_mouse_up(&mut self) {
+        match self.drag {
+            Drag::Seek => self.seek_to(self.pos),
+            Drag::Volume => self.save_settings(),
+            Drag::None => {}
+        }
+        self.drag = Drag::None;
+    }
+
+    fn on_wheel(&mut self, delta: i32) {
+        let rows = ((self.layout().list.bottom - self.layout().list.top) / self.layout().row_h).max(1);
+        let step = if delta > 0 { -3 } else { 3 };
+        let max_scroll = self
+            .visible
+            .len()
+            .saturating_sub(rows as usize);
+        let next = self.scroll as i32 + step;
+        self.scroll = next.clamp(0, max_scroll as i32) as usize;
+        self.invalidate();
+    }
+
+    fn on_key(&mut self, key: u32) {
+        match key {
+            k if k == VK_SPACE.0 as u32 => self.toggle_play(),
+            k if k == VK_LEFT.0 as u32 => self.seek_to((self.pos - 5.0).max(0.0)),
+            k if k == VK_RIGHT.0 as u32 => {
+                let dur = self.current_duration();
+                if dur > 0.0 {
+                    self.seek_to((self.pos + 5.0).min(dur));
+                }
+            }
+            k if k == VK_UP.0 as u32 => self.set_volume(self.volume + 0.05),
+            k if k == VK_DOWN.0 as u32 => self.set_volume(self.volume - 0.05),
+            _ => {}
+        }
+    }
+
+    fn on_search_changed(&mut self) {
+        let mut buf = [0u16; 256];
+        let len = unsafe { GetWindowTextW(self.edit, &mut buf) } as usize;
+        self.search = String::from_utf16_lossy(&buf[..len]);
+        self.refilter();
+        self.invalidate();
+    }
+
+    fn context_menu_row(&mut self, row: usize) {
+        let Some(&idx) = self.visible.get(row) else {
+            return;
+        };
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUEUE_NEXT, w_ptr("Play next"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUEUE_ADD, w_ptr("Add to queue"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CMD_QUEUE_CLEAR, w_ptr("Clear queue"));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(self.hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            let _ = PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+
+            match cmd.0 as usize {
+                CMD_QUEUE_NEXT => self.queue.push_front(idx),
+                CMD_QUEUE_ADD => self.queue.push_back(idx),
+                CMD_QUEUE_CLEAR => self.queue.clear(),
+                _ => {}
+            }
+            self.invalidate();
+        }
+    }
+
+    unsafe fn tray_menu(&mut self, hwnd: HWND) {
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let play = if self.playing { w_ptr("Pause") } else { w_ptr("Play") };
+            let _ = AppendMenuW(menu, MF_STRING, CMD_PLAY, play);
+            let _ = AppendMenuW(menu, MF_STRING, CMD_PREV, w_ptr("Previous"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_NEXT, w_ptr("Next"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CMD_SHOW, w_ptr("Show"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_HIDE, w_ptr("Hide"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT, w_ptr("Exit"));
+
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = SetForegroundWindow(hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x,
+                pt.y,
+                None,
+                hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+
+            match cmd.0 as usize {
+                CMD_PLAY => self.toggle_play(),
+                CMD_PREV => self.prev_track(),
+                CMD_NEXT => self.next_track(true),
+                CMD_SHOW => {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+                CMD_HIDE => {
+                    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                }
+                CMD_EXIT => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ------------------------------------------------ painting
+
+    unsafe fn paint(&mut self, hwnd: HWND) {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        if rc.right <= 0 || rc.bottom <= 0 {
+            unsafe {
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return;
+        }
+
+        let mem = unsafe { CreateCompatibleDC(Some(hdc)) };
+        let bmp = unsafe { CreateCompatibleBitmap(hdc, rc.right, rc.bottom) };
+        let old = unsafe { SelectObject(mem, HGDIOBJ(bmp.0)) };
+
+        unsafe { self.draw(mem, rc) };
+
+        unsafe {
+            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(mem), 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(HGDIOBJ(bmp.0));
+            let _ = DeleteDC(mem);
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
+    unsafe fn draw(&mut self, hdc: HDC, rc: RECT) {
+        let l = self.layout();
+        let s = self.scale();
+
+        unsafe {
+            fill(hdc, rc, BG);
+
+            // --- toolbar
+            let hot = |h: Option<Hit>, want: Hit| h == Some(want);
+            round_fill(
+                hdc,
+                l.open,
+                if hot(self.hover, Hit::Open) { HOVER } else { BG },
+                (4.0 * s) as i32,
+            );
+            draw_folder(hdc, l.open, hot(self.hover, Hit::Open), s);
+
+            round_fill(
+                hdc,
+                l.shuffle,
+                if self.shuffle {
+                    SEL
+                } else if hot(self.hover, Hit::Shuffle) {
+                    HOVER
+                } else {
+                    BG
+                },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(
+                hdc,
+                l.shuffle,
+                "\u{E8B1}",
+                self.fonts.icons,
+                if self.shuffle { ACCENT } else { DIM },
+            );
+
+            let focused = GetFocus() == self.edit;
+            let mut field = l.search;
+            field.top -= (1.0 * s) as i32;
+            field.bottom += (1.0 * s) as i32;
+            round_fill(hdc, field, PANEL, (4.0 * s) as i32);
+            if focused {
+                // 1px accent ring
+                fill(hdc, rect(field.left, field.bottom - (1.0 * s).max(1.0) as i32, field.right, field.bottom), ACCENT);
+            }
+
+            // --- list
+            self.draw_list(hdc, &l, s);
+
+            // --- bottom
+            fill(hdc, rect(rc.left, l.cover.top - (4.0 * s) as i32, rc.right, l.cover.top - (4.0 * s) as i32 + 1), COLORREF(0x0030_2a26));
+
+            if let Some(cover) = &self.cover {
+                let mem = CreateCompatibleDC(Some(hdc));
+                let old = SelectObject(mem, HGDIOBJ(cover.bmp.0));
+                let _ = SetStretchBltMode(hdc, HALFTONE);
+                let _ = SetBrushOrgEx(hdc, 0, 0, None);
+                let _ = StretchBlt(
+                    hdc,
+                    l.cover.left,
+                    l.cover.top,
+                    l.cover.right - l.cover.left,
+                    l.cover.bottom - l.cover.top,
+                    Some(mem),
+                    0,
+                    0,
+                    cover.w,
+                    cover.h,
+                    SRCCOPY,
+                );
+                SelectObject(mem, old);
+                let _ = DeleteDC(mem);
+            } else {
+                round_fill(hdc, l.cover, PANEL, (4.0 * s) as i32);
+                draw_glyph(hdc, l.cover, "\u{E8D6}", self.fonts.icons, DIM);
+            }
+
+            let info = rect(
+                l.cover.right + (10.0 * s) as i32,
+                l.cover.top + (3.0 * s) as i32,
+                l.list.right,
+                l.cover.bottom,
+            );
+            let (title, artist) = match self.current.and_then(|i| self.tracks.get(i)) {
+                Some(t) => (t.title.clone(), t.artist.clone()),
+                None => ("Nothing playing".to_string(), String::new()),
+            };
+            let mut title_rc = info;
+            title_rc.bottom -= (14.0 * s) as i32;
+            draw_text(
+                hdc,
+                title_rc,
+                &title,
+                self.fonts.bold,
+                if self.current.is_some() { TEXT } else { DIM },
+                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            );
+            let artist_rc = rect(info.left, info.bottom - (16.0 * s) as i32, info.right, info.bottom);
+            draw_text(
+                hdc,
+                artist_rc,
+                &artist,
+                self.fonts.small,
+                DIM,
+                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            );
+
+            // seek
+            let dur = self.current_duration();
+            draw_text(
+                hdc,
+                l.cur_time,
+                &fmt_time(self.pos),
+                self.fonts.small,
+                DIM,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            );
+            draw_text(
+                hdc,
+                l.tot_time,
+                &fmt_time(dur),
+                self.fonts.small,
+                DIM,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+            );
+            let frac = if dur > 0.0 {
+                (self.pos / dur) as f32
+            } else {
+                0.0
+            };
+            draw_bar(
+                hdc,
+                l.seek,
+                frac,
+                hot(self.hover, Hit::Seek) || self.drag == Drag::Seek,
+                s,
+            );
+
+            // transport
+            round_fill(
+                hdc,
+                l.prev,
+                if hot(self.hover, Hit::Prev) { HOVER } else { BG },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(hdc, l.prev, "\u{E892}", self.fonts.icons, TEXT);
+
+            round_fill(hdc, l.play, COLORREF(0x0032_2418), (4.0 * s) as i32);
+            draw_glyph(
+                hdc,
+                l.play,
+                if self.playing { "\u{E769}" } else { "\u{E768}" },
+                self.fonts.icons,
+                ACCENT,
+            );
+
+            round_fill(
+                hdc,
+                l.next,
+                if hot(self.hover, Hit::Next) { HOVER } else { BG },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(hdc, l.next, "\u{E893}", self.fonts.icons, TEXT);
+
+            // volume
+            draw_glyph(hdc, l.vol_icon, "\u{E767}", self.fonts.icons, DIM);
+            draw_bar(
+                hdc,
+                l.vol_bar,
+                self.volume,
+                hot(self.hover, Hit::Volume) || self.drag == Drag::Volume,
+                s,
+            );
+            draw_text(
+                hdc,
+                l.vol_pct,
+                &format!("{}%", (self.volume * 100.0).round() as i32),
+                self.fonts.small,
+                DIM,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+            );
+
+            round_fill(
+                hdc,
+                l.min_btn,
+                if hot(self.hover, Hit::Minimize) { HOVER } else { BG },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(hdc, l.min_btn, "\u{E921}", self.fonts.icons, DIM);
+
+            // status line
+            let status = if let Some(err) = &self.error {
+                (err.clone(), ERROR_RED)
+            } else if self.scan.is_some() {
+                (format!("Scanning… {} files", self.scan_count), DIM)
+            } else if self.tracks.is_empty() {
+                ("Open a folder to start".to_string(), DIM)
+            } else {
+                let mut text = format!("{} tracks", self.tracks.len());
+                if !self.queue.is_empty() {
+                    text.push_str(&format!(" · queue {}", self.queue.len()));
+                }
+                (text, DIM)
+            };
+            draw_text(
+                hdc,
+                l.status,
+                &status.0,
+                self.fonts.small,
+                status.1,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+            );
+
+            if self.scan.is_some() {
+                let bar = rect(
+                    l.status.left,
+                    l.status.bottom - (2.0 * s) as i32,
+                    l.status.right,
+                    l.status.bottom,
+                );
+                fill(hdc, bar, PANEL);
+                let width = (bar.right - bar.left) as f32;
+                let seg = width * 0.3;
+                let phase = (self.anim % 60) as f32 / 60.0;
+                let x = bar.left + ((width + seg) * phase) as i32 - seg as i32;
+                let seg_rect = rect(
+                    x.max(bar.left),
+                    bar.top,
+                    (x + seg as i32).min(bar.right),
+                    bar.bottom,
+                );
+                fill(hdc, seg_rect, ACCENT);
+            }
+        }
+    }
+
+    unsafe fn draw_list(&self, hdc: HDC, l: &Layout, s: f32) {
+        let rows = ((l.list.bottom - l.list.top) / l.row_h).max(1) as usize;
+        let total = self.visible.len();
+        let visible_rows = rows.min(total.saturating_sub(self.scroll));
+
+        unsafe {
+            for i in 0..visible_rows {
+                let vi = self.scroll + i;
+                let idx = self.visible[vi];
+                let y = l.list.top + i as i32 * l.row_h;
+                let mut row = rect(l.list.left, y, l.list.right - l.scrollbar - 2, y + l.row_h);
+                row.bottom -= 1;
+
+                let is_current = self.current == Some(idx);
+                let hovered = self.hover == Some(Hit::Row(vi));
+
+                if is_current {
+                    round_fill(hdc, row, SEL, (3.0 * s) as i32);
+                } else if hovered {
+                    round_fill(hdc, row, HOVER, (3.0 * s) as i32);
+                }
+
+                let track = &self.tracks[idx];
+                let mut left = row.left + (7.0 * s) as i32;
+                if is_current {
+                    let bar = rect(
+                        left,
+                        row.top + (5.0 * s) as i32,
+                        left + (2.0 * s).max(1.0) as i32,
+                        row.bottom - (5.0 * s) as i32,
+                    );
+                    fill(hdc, bar, ACCENT);
+                    left += (8.0 * s) as i32;
+                }
+
+                let artist_w = (((row.right - row.left) as f32) * 0.38)
+                    .min(150.0 * s)
+                    .max(60.0 * s) as i32;
+                let title_rc = rect(left, row.top, row.right - artist_w, row.bottom);
+                draw_text(
+                    hdc,
+                    title_rc,
+                    &track.title,
+                    if is_current { self.fonts.bold } else { self.fonts.ui },
+                    TEXT,
+                    DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                );
+
+                if !track.artist.is_empty() {
+                    let artist_rc = rect(
+                        row.right - artist_w,
+                        row.top,
+                        row.right - (6.0 * s) as i32,
+                        row.bottom,
+                    );
+                    draw_text(
+                        hdc,
+                        artist_rc,
+                        &track.artist,
+                        self.fonts.small,
+                        DIM,
+                        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
+                }
+            }
+
+            if total == 0 {
+                let text = if self.scan.is_some() {
+                    format!("Scanning… {} files", self.scan_count)
+                } else {
+                    "No matches".to_string()
+                };
+                draw_text(
+                    hdc,
+                    l.list,
+                    &text,
+                    self.fonts.ui,
+                    DIM,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                );
+            }
+
+            // scrollbar
+            let max_scroll = total.saturating_sub(rows);
+            if max_scroll > 0 {
+                let track = rect(l.list.right - l.scrollbar, l.list.top, l.list.right, l.list.bottom);
+                let height = (track.bottom - track.top).max(1);
+                let thumb_h = ((rows as f32 / total as f32) * height as f32).max(20.0) as i32;
+                let offset = ((self.scroll as f32 / max_scroll as f32)
+                    * (height - thumb_h) as f32) as i32;
+                let thumb = rect(track.left, track.top + offset, track.right, track.top + offset + thumb_h);
+                round_fill(hdc, thumb, TRACK_BG, 3);
             }
         }
     }
 }
 
-// ---------------------------------------------------------------- playback order
+impl Drop for App {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(cover) = self.cover.take() {
+                let _ = DeleteObject(HGDIOBJ(cover.bmp.0));
+            }
+            let _ = DeleteObject(HGDIOBJ(self.fonts.ui.0));
+            let _ = DeleteObject(HGDIOBJ(self.fonts.bold.0));
+            let _ = DeleteObject(HGDIOBJ(self.fonts.small.0));
+            let _ = DeleteObject(HGDIOBJ(self.fonts.icons.0));
+            let _ = DeleteObject(HGDIOBJ(self.brush_input.0));
+            if !self.icon.is_invalid() {
+                let _ = DestroyIcon(self.icon);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e3779b97f4a7c15)
+        | 1
+}
+
+fn fmt_time(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
 
 fn sequential_next(len: usize, current: Option<usize>, wrap: bool) -> Option<usize> {
     if len == 0 {
@@ -121,723 +1555,46 @@ fn shuffled_next(len: usize, current: usize, rand: u64) -> usize {
     n
 }
 
-fn fmt_time(secs: f64) -> String {
-    let secs = secs.max(0.0) as u64;
-    format!("{}:{:02}", secs / 60, secs % 60)
+fn set_tip(dst: &mut [u16; 128], text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().take(126).collect();
+    dst[..wide.len()].copy_from_slice(&wide);
+    dst[wide.len()] = 0;
 }
 
-// ---------------------------------------------------------------- app
+unsafe fn make_icon() -> HICON {
+    let (rgba, w, h) = icon_rgba();
+    unsafe {
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w as i32;
+        bmi.bmiHeader.biHeight = -(h as i32);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
 
-#[derive(Clone, Copy, PartialEq)]
-enum TrayAction {
-    PlayPause,
-    Next,
-    Prev,
-    Show,
-    Hide,
-    Exit,
-}
+        let mut bits: *mut c_void = null_mut();
+        let Ok(color) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            return HICON::default();
+        };
+        std::ptr::copy_nonoverlapping(rgba.as_ptr(), bits as *mut u8, rgba.len());
 
-struct App {
-    audio: Option<Audio>,
-    error: Option<String>,
-
-    tracks: Vec<Track>,
-    visible: Vec<usize>,
-    search: String,
-
-    current: Option<usize>,
-    playing: bool,
-    pos: f64,
-    seeking: bool,
-    volume: f32,
-    shuffle: bool,
-    queue: VecDeque<usize>,
-    show_queue: bool,
-
-    cover: Option<egui::TextureHandle>,
-    rng: u64,
-
-    tray: Option<Tray>,
-    tray_label_playing: bool,
-    tray_tooltip: String,
-}
-
-struct Tray {
-    icon: TrayIcon,
-    play_pause: MenuItem,
-    next: MenuItem,
-    prev: MenuItem,
-    show: MenuItem,
-    hide: MenuItem,
-    exit: MenuItem,
-}
-
-impl Tray {
-    fn new() -> Option<Self> {
-        let play_pause = MenuItem::new("Play", true, None);
-        let prev = MenuItem::new("Previous", true, None);
-        let next = MenuItem::new("Next", true, None);
-        let show = MenuItem::new("Show", true, None);
-        let hide = MenuItem::new("Hide", true, None);
-        let exit = MenuItem::new("Exit", true, None);
-
-        let menu = Menu::new();
-        let _ = menu.append_items(&[
-            &play_pause,
-            &prev,
-            &next,
-            &PredefinedMenuItem::separator(),
-            &show,
-            &hide,
-            &PredefinedMenuItem::separator(),
-            &exit,
-        ]);
-
-        let (rgba, w, h) = icon_pixels();
-        let icon = TrayIconBuilder::new()
-            .with_id("just-music")
-            .with_tooltip("Just Music")
-            .with_icon(tray_icon::Icon::from_rgba(rgba, w, h).ok()?)
-            .with_menu(Box::new(menu))
-            .build()
-            .ok()?;
-
-        Some(Self {
-            icon,
-            play_pause,
-            next,
-            prev,
-            show,
-            hide,
-            exit,
-        })
+        let mask = CreateBitmap(w as i32, h as i32, 1, 1, None);
+        let info = ICONINFO {
+            fIcon: windows::core::BOOL::from(true),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        let icon = CreateIconIndirect(&info).unwrap_or_default();
+        let _ = DeleteObject(HGDIOBJ(color.0));
+        let _ = DeleteObject(HGDIOBJ(mask.0));
+        icon
     }
 }
 
-impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let ctx = cc.egui_ctx.clone();
-        ctx.set_theme(ThemePreference::Dark);
-        ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = vec2(6.0, 6.0);
-            s.spacing.button_padding = vec2(8.0, 3.0);
-        });
-
-        // Keep `logic` running (seek bar, track advance, tray) even while the
-        // window is hidden. A 200 ms tick is plenty and costs nothing.
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(200));
-                ctx.request_repaint();
-            }
-        });
-
-        let audio = match Audio::open() {
-            Ok(a) => Some(a),
-            Err(e) => {
-                eprintln!("audio device: {e}");
-                None
-            }
-        };
-
-        let mut app = Self {
-            audio,
-            error: None,
-            tracks: Vec::new(),
-            visible: Vec::new(),
-            search: String::new(),
-            current: None,
-            playing: false,
-            pos: 0.0,
-            seeking: false,
-            volume: 0.7,
-            shuffle: false,
-            queue: VecDeque::new(),
-            show_queue: false,
-            cover: None,
-            rng: seed(),
-            tray: Tray::new(),
-            tray_label_playing: false,
-            tray_tooltip: String::new(),
-        };
-
-        // `just_music.exe <folder>` opens that folder right away.
-        if let Some(dir) = std::env::args().nth(1) {
-            let dir = PathBuf::from(dir);
-            if dir.is_dir() {
-                app.load_folder(dir);
-            }
-        }
-
-        app
-    }
-
-    fn load_folder(&mut self, dir: PathBuf) {
-        let mut tracks = Vec::new();
-        scan_dir(&dir, &mut tracks);
-        tracks.sort_by(|a, b| {
-            a.artist
-                .to_lowercase()
-                .cmp(&b.artist.to_lowercase())
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-        });
-        self.tracks = tracks;
-        self.search.clear();
-        self.refilter();
-    }
-
-    fn refilter(&mut self) {
-        let q = self.search.trim().to_lowercase();
-        self.visible = if q.is_empty() {
-            (0..self.tracks.len()).collect()
-        } else {
-            self.tracks
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| {
-                    t.title.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q)
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
-    }
-
-    fn rng_next(&mut self) -> u64 {
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        x
-    }
-
-    fn play_index(&mut self, idx: usize, ctx: &egui::Context) {
-        let Some(track) = self.tracks.get(idx) else {
-            return;
-        };
-        let path = track.path.clone();
-        let title = track.title.clone();
-
-        let Some(audio) = &self.audio else {
-            self.error = Some("No audio output device".into());
-            return;
-        };
-        match audio.play(&path, self.volume) {
-            Ok(()) => {
-                self.current = Some(idx);
-                self.pos = 0.0;
-                self.playing = true;
-                self.error = None;
-                self.load_cover(ctx);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "{title} — Just Music"
-                )));
-            }
-            Err(e) => {
-                // Broken file: stop instead of looping over the whole folder.
-                self.current = None;
-                self.playing = false;
-                self.error = Some(format!("{title}: {e}"));
-            }
-        }
-    }
-
-    fn pick_next(&mut self, wrap: bool) -> Option<usize> {
-        if let Some(i) = self.queue.pop_front() {
-            return Some(i);
-        }
-        let len = self.tracks.len();
-        if self.shuffle
-            && let Some(cur) = self.current
-        {
-            let rand = self.rng_next();
-            return Some(shuffled_next(len, cur, rand));
-        }
-        sequential_next(len, self.current, wrap)
-    }
-
-    fn next_track(&mut self, wrap: bool, ctx: &egui::Context) {
-        match self.pick_next(wrap) {
-            Some(i) => self.play_index(i, ctx),
-            None => {
-                if let Some(a) = &self.audio {
-                    a.stop();
-                }
-                self.playing = false;
-                self.pos = 0.0;
-            }
-        }
-    }
-
-    fn prev_track(&mut self, ctx: &egui::Context) {
-        // Same behaviour as every other player: restart first, then step back.
-        if self.pos > 3.0 {
-            self.seek(0.0);
-            return;
-        }
-        let len = self.tracks.len();
-        let Some(cur) = self.current else {
-            if len > 0 {
-                self.play_index(0, ctx);
-            }
-            return;
-        };
-        let idx = if cur > 0 { cur - 1 } else { len.saturating_sub(1) };
-        if len > 0 {
-            self.play_index(idx, ctx);
-        }
-    }
-
-    fn seek(&mut self, secs: f64) {
-        self.pos = secs;
-        if let Some(a) = &self.audio {
-            a.seek(Duration::from_secs_f64(secs));
-        }
-    }
-
-    fn toggle_play(&mut self, ctx: &egui::Context) {
-        if self.audio.is_none() {
-            return;
-        }
-        let finished = self.audio.as_ref().is_some_and(|a| a.finished());
-        // Nothing loaded, or the last track already ran to the end.
-        if self.current.is_none() || finished {
-            if !self.tracks.is_empty() {
-                self.next_track(true, ctx);
-            }
-            return;
-        }
-        let audio = self.audio.as_ref().unwrap();
-        if audio.is_paused() {
-            audio.resume();
-        } else {
-            audio.pause();
-        }
-        self.playing = !audio.is_paused();
-    }
-
-    fn load_cover(&mut self, ctx: &egui::Context) {
-        self.cover = None;
-        let Some(track) = self.current.and_then(|i| self.tracks.get(i)) else {
-            return;
-        };
-        let Ok(file) = lofty::read_from_path(&track.path) else {
-            return;
-        };
-        let Some(pic) = file
-            .primary_tag()
-            .or_else(|| file.first_tag())
-            .and_then(|t| t.pictures().first())
-        else {
-            return;
-        };
-        let Ok(img) = image::load_from_memory(pic.data()) else {
-            return;
-        };
-        let img = img.thumbnail(96, 96).to_rgba8();
-        let size = [img.width() as usize, img.height() as usize];
-        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
-        self.cover = Some(ctx.load_texture("cover", pixels, egui::TextureOptions::LINEAR));
-    }
-
-    fn tick(&mut self, ctx: &egui::Context) {
-        let finished = self
-            .audio
-            .as_ref()
-            .is_some_and(|a| self.current.is_some() && a.finished());
-        if finished {
-            self.next_track(false, ctx);
-            return;
-        }
-        if self.current.is_some()
-            && !self.seeking
-            && let Some(a) = &self.audio
-        {
-            self.pos = a.position().as_secs_f64();
-        }
-        if let Some(a) = &self.audio {
-            self.playing = !a.is_paused();
-        }
-    }
-
-    fn poll_tray(&mut self, ctx: &egui::Context) {
-        let Some(tray) = &self.tray else {
-            return;
-        };
-
-        let mut actions = Vec::new();
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            let id = &ev.id;
-            let action = if id == tray.play_pause.id() {
-                TrayAction::PlayPause
-            } else if id == tray.next.id() {
-                TrayAction::Next
-            } else if id == tray.prev.id() {
-                TrayAction::Prev
-            } else if id == tray.show.id() {
-                TrayAction::Show
-            } else if id == tray.hide.id() {
-                TrayAction::Hide
-            } else if id == tray.exit.id() {
-                TrayAction::Exit
-            } else {
-                continue;
-            };
-            actions.push(action);
-        }
-
-        for action in actions {
-            match action {
-                TrayAction::PlayPause => self.toggle_play(ctx),
-                TrayAction::Next => self.next_track(true, ctx),
-                TrayAction::Prev => self.prev_track(ctx),
-                TrayAction::Show => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                TrayAction::Hide => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                }
-                TrayAction::Exit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            }
-        }
-
-        // Keep the tray in sync with playback state / current track.
-        if self.tray_label_playing != self.playing {
-            self.tray_label_playing = self.playing;
-            if let Some(tray) = &self.tray {
-                tray.play_pause
-                    .set_text(if self.playing { "Pause" } else { "Play" });
-            }
-        }
-        let tooltip = match self.current.and_then(|i| self.tracks.get(i)) {
-            Some(t) if t.artist.is_empty() => t.title.clone(),
-            Some(t) => format!("{} — {}", t.artist, t.title),
-            None => String::new(),
-        };
-        if tooltip != self.tray_tooltip {
-            self.tray_tooltip = tooltip;
-            if let Some(tray) = &self.tray {
-                let tip = if self.tray_tooltip.is_empty() {
-                    "Just Music".to_string()
-                } else {
-                    self.tray_tooltip.clone()
-                };
-                let _ = tray.icon.set_tooltip(Some(tip));
-            }
-        }
-    }
-}
-
-impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_tray(ctx);
-        self.tick(ctx);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                if ui.button("Open folder").clicked()
-                    && let Some(dir) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.load_folder(dir);
-                }
-                if ui
-                    .selectable_label(self.shuffle, "Shuffle")
-                    .on_hover_text("Play tracks in random order")
-                    .clicked()
-                {
-                    self.shuffle = !self.shuffle;
-                }
-                if !self.queue.is_empty()
-                    && ui.button(format!("Queue {}", self.queue.len())).clicked()
-                {
-                    self.show_queue = true;
-                }
-            });
-            let search = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search title or artist")
-                    .desired_width(f32::INFINITY),
-            );
-            if search.changed() {
-                self.refilter();
-            }
-            ui.add_space(2.0);
-        });
-
-        egui::Panel::bottom("player").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.player_bar(ui);
-            ui.add_space(4.0);
-        });
-
-        if let Some(err) = &self.error {
-            egui::Panel::bottom("error").show(ui, |ui| {
-                ui.label(RichText::new(err).color(Color32::LIGHT_RED).size(11.0));
-            });
-        }
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.tracks.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("Open a folder to start").weak().size(13.0));
-                });
-                return;
-            }
-            if self.visible.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("No matches").weak().size(13.0));
-                });
-                return;
-            }
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, ROW_H, self.visible.len(), |ui, range| {
-                    for row in range {
-                        let idx = self.visible[row];
-                        let is_current = self.current == Some(idx);
-                        let resp = track_row(ui, &self.tracks[idx], is_current);
-                        if resp.clicked() {
-                            self.play_index(idx, &ctx);
-                        }
-                        resp.context_menu(|ui| {
-                            if ui.button("Play next").clicked() {
-                                self.queue.push_front(idx);
-                                ui.close();
-                            }
-                            if ui.button("Add to queue").clicked() {
-                                self.queue.push_back(idx);
-                                ui.close();
-                            }
-                        });
-                    }
-                });
-        });
-
-        if self.show_queue {
-            self.queue_window(&ctx);
-        }
-    }
-}
-
-impl App {
-    fn player_bar(&mut self, ui: &mut egui::Ui) {
-        let (title, artist, dur) = match self.current.and_then(|i| self.tracks.get(i)) {
-            Some(t) => (t.title.clone(), t.artist.clone(), t.duration),
-            None => ("Nothing playing".to_string(), String::new(), 0.0),
-        };
-
-        ui.horizontal(|ui| {
-            match &self.cover {
-                Some(tex) => {
-                    let size = Vec2::splat(46.0);
-                    ui.image(egui::load::SizedTexture::new(tex.id(), size));
-                }
-                None => {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(46.0), Sense::hover());
-                    ui.painter().rect_filled(rect, 4.0, Color32::from_gray(38));
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "♪",
-                        FontId::proportional(20.0),
-                        Color32::from_gray(90),
-                    );
-                }
-            }
-            ui.vertical(|ui| {
-                ui.add_space(5.0);
-                ui.add(
-                    egui::Label::new(RichText::new(title).strong().size(13.0))
-                        .truncate()
-                        .sense(Sense::hover()),
-                );
-                ui.add(egui::Label::new(RichText::new(artist).weak().size(11.0)).truncate());
-            });
-        });
-
-        // Seek bar
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(fmt_time(self.pos)).size(11.0).weak());
-            let width = (ui.available_width() - 44.0).max(60.0);
-            let mut value = self.pos as f32;
-            let resp = ui.add_sized(
-                [width, 16.0],
-                egui::Slider::new(&mut value, 0.0..=dur.max(1.0) as f32)
-                    .show_value(false)
-                    .trailing_fill(true),
-            );
-            if resp.drag_started() {
-                self.seeking = true;
-            }
-            if resp.dragged() {
-                self.pos = value as f64;
-            }
-            if resp.drag_stopped() {
-                self.seeking = false;
-                self.seek(value as f64);
-            } else if resp.clicked() {
-                self.seek(value as f64);
-            }
-            ui.label(RichText::new(fmt_time(dur)).size(11.0).weak());
-        });
-
-        // Controls
-        ui.horizontal(|ui| {
-            let ctx = ui.ctx().clone();
-            if ui.button("Prev").clicked() {
-                self.prev_track(&ctx);
-            }
-            let label = if self.playing { "Pause" } else { "Play" };
-            if ui.button(label).clicked() {
-                self.toggle_play(&ctx);
-            }
-            if ui.button("Next").clicked() {
-                self.next_track(true, &ctx);
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().slider_width = 80.0;
-                let resp = ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                if resp.changed()
-                    && let Some(a) = &self.audio
-                {
-                    a.set_volume(self.volume);
-                }
-                ui.label("Vol");
-            });
-        });
-    }
-
-    fn queue_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_queue;
-        egui::Window::new("Queue")
-            .open(&mut open)
-            .default_width(240.0)
-            .resizable(false)
-            .show(ctx, |ui| {
-                if self.queue.is_empty() {
-                    ui.label(RichText::new("Empty").weak());
-                }
-                let mut remove = None;
-                for (slot, &idx) in self.queue.iter().enumerate() {
-                    let name = self
-                        .tracks
-                        .get(idx)
-                        .map(|t| t.title.clone())
-                        .unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        if ui.small_button("x").clicked() {
-                            remove = Some(slot);
-                        }
-                        ui.add(egui::Label::new(RichText::new(name).size(12.0)).truncate());
-                    });
-                }
-                if let Some(slot) = remove {
-                    self.queue.remove(slot);
-                }
-                if !self.queue.is_empty() && ui.button("Clear").clicked() {
-                    self.queue.clear();
-                }
-            });
-        self.show_queue = open;
-    }
-}
-
-fn track_row(ui: &mut egui::Ui, track: &Track, is_current: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
-    let painter = ui.painter().clone();
-    let visuals = ui.visuals().clone();
-
-    if is_current {
-        painter.rect_filled(rect, 3.0, visuals.selection.bg_fill);
-    } else if resp.hovered() {
-        painter.rect_filled(rect, 3.0, visuals.widgets.hovered.bg_fill);
-    }
-
-    let text_color = if is_current {
-        visuals.strong_text_color()
-    } else {
-        visuals.text_color()
-    };
-    let mut left = rect.left() + 6.0;
-    if is_current {
-        painter.text(
-            pos2(left, rect.center().y),
-            Align2::LEFT_CENTER,
-            "▶",
-            FontId::proportional(9.0),
-            ACCENT,
-        );
-        left += 12.0;
-    }
-
-    let artist_w = (rect.width() * 0.38).min(130.0);
-    let title_clip = Rect::from_min_max(
-        pos2(left, rect.top()),
-        pos2(rect.right() - artist_w, rect.bottom()),
-    );
-    painter
-        .with_clip_rect(title_clip.intersect(painter.clip_rect()))
-        .text(
-            pos2(left, rect.center().y),
-            Align2::LEFT_CENTER,
-            &track.title,
-            FontId::proportional(13.0),
-            text_color,
-        );
-
-    if !track.artist.is_empty() {
-        let clip = Rect::from_min_max(
-            pos2(rect.right() - artist_w, rect.top()),
-            pos2(rect.right() - 4.0, rect.bottom()),
-        );
-        painter
-            .with_clip_rect(clip.intersect(painter.clip_rect()))
-            .text(
-                pos2(rect.right() - 6.0, rect.center().y),
-                Align2::RIGHT_CENTER,
-                &track.artist,
-                FontId::proportional(11.0),
-                visuals.weak_text_color(),
-            );
-    }
-
-    resp
-}
-
-fn seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9e3779b97f4a7c15)
-        | 1
-}
-
-// ---------------------------------------------------------------- icons
-
-fn app_icon_data() -> egui::IconData {
-    let (rgba, w, h) = icon_pixels();
-    egui::IconData {
-        rgba,
-        width: w,
-        height: h,
-    }
-}
-
-/// 32x32 rounded dark tile with a white play triangle.
-fn icon_pixels() -> (Vec<u8>, u32, u32) {
+/// 32x32 rounded dark tile with a play triangle.
+fn icon_rgba() -> (Vec<u8>, u32, u32) {
     const S: u32 = 32;
     let mut rgba = vec![0u8; (S * S * 4) as usize];
     for y in 0..S {
@@ -849,12 +1606,12 @@ fn icon_pixels() -> (Vec<u8>, u32, u32) {
             let in_y = py.clamp(r, S as f32 - r);
             let d = ((px - in_x).powi(2) + (py - in_y).powi(2)).sqrt();
             if d > r {
-                continue; // transparent corner
+                continue;
             }
             let tri = x as f32 >= 11.0
                 && x as f32 <= 23.0
                 && (y as f32 - 16.0).abs() <= 7.0 - (x as f32 - 11.0) * 0.29;
-            let (r_, g_, b_) = if tri { (245, 245, 245) } else { (28, 30, 36) };
+            let (r_, g_, b_) = if tri { (235, 240, 250) } else { (26, 26, 31) };
             let i = ((y * S + x) * 4) as usize;
             rgba[i] = r_;
             rgba[i + 1] = g_;
@@ -863,6 +1620,197 @@ fn icon_pixels() -> (Vec<u8>, u32, u32) {
         }
     }
     (rgba, S, S)
+}
+
+// ---------------------------------------------------------------- window
+
+unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_CREATE => {
+                let app = Box::new(App::new(hwnd));
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+                SetTimer(Some(hwnd), TIMER_ID, 200, None);
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+                if !ptr.is_null() {
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let mut app = Box::from_raw(ptr);
+                    app.save_settings();
+                    app.remove_tray();
+                }
+                let _ = KillTimer(Some(hwnd), TIMER_ID);
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => {
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+                let Some(app) = ptr.as_mut() else {
+                    return DefWindowProcW(hwnd, msg, wp, lp);
+                };
+
+                match msg {
+                    WM_PAINT => {
+                        app.paint(hwnd);
+                        LRESULT(0)
+                    }
+                    WM_ERASEBKGND => LRESULT(1),
+                    WM_TIMER => {
+                        app.tick();
+                        if IsWindowVisible(hwnd).as_bool() {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        LRESULT(0)
+                    }
+                    WM_SIZE => {
+                        let l = app.layout();
+                        let w = (l.search.right - l.search.left).max(10);
+                        let h = (l.search.bottom - l.search.top).max(10);
+                        let _ = MoveWindow(app.edit, l.search.left, l.search.top, w, h, true);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        LRESULT(0)
+                    }
+                    WM_MOUSEMOVE => {
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                        app.on_mouse_move(x, y);
+                        LRESULT(0)
+                    }
+                    WM_LBUTTONDOWN => {
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                        app.on_mouse_down(x, y);
+                        LRESULT(0)
+                    }
+                    WM_LBUTTONUP => {
+                        app.on_mouse_up();
+                        LRESULT(0)
+                    }
+                    WM_RBUTTONUP => {
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                        if let Some(Hit::Row(row)) = app.hit_test(x, y) {
+                            app.context_menu_row(row);
+                        }
+                        LRESULT(0)
+                    }
+                    WM_MOUSEWHEEL => {
+                        let delta = ((wp.0 >> 16) & 0xffff) as i16 as i32;
+                        app.on_wheel(delta);
+                        LRESULT(0)
+                    }
+                    WM_KEYDOWN => {
+                        app.on_key(wp.0 as u32);
+                        LRESULT(0)
+                    }
+                    WM_COMMAND => {
+                        let code = ((wp.0 >> 16) & 0xffff) as u32;
+                        if code == EN_CHANGE_CODE && HWND(lp.0 as *mut c_void) == app.edit {
+                            app.on_search_changed();
+                        }
+                        LRESULT(0)
+                    }
+                    WM_CTLCOLOREDIT => {
+                        if HWND(lp.0 as *mut c_void) == app.edit {
+                            let hdc = HDC(wp.0 as *mut c_void);
+                            SetTextColor(hdc, TEXT);
+                            SetBkColor(hdc, PANEL);
+                            return LRESULT(app.brush_input.0 as isize);
+                        }
+                        DefWindowProcW(hwnd, msg, wp, lp)
+                    }
+                    WM_TRAY => {
+                        let event = (lp.0 & 0xffff) as u32;
+                        match event {
+                            WM_RBUTTONUP | WM_CONTEXTMENU => app.tray_menu(hwnd),
+                            WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+                                let _ = ShowWindow(hwnd, SW_SHOW);
+                                let _ = ShowWindow(hwnd, SW_RESTORE);
+                                let _ = SetForegroundWindow(hwnd);
+                            }
+                            _ => {}
+                        }
+                        LRESULT(0)
+                    }
+                    WM_CLOSE => {
+                        // Closing hides to tray; exit lives in the tray menu.
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        LRESULT(0)
+                    }
+                    WM_GETMINMAXINFO => {
+                        if lp.0 != 0 {
+                            let info = &mut *(lp.0 as *mut MINMAXINFO);
+                            info.ptMinTrackSize.x = (320.0 * app.scale()) as i32;
+                            info.ptMinTrackSize.y = (400.0 * app.scale()) as i32;
+                        }
+                        LRESULT(0)
+                    }
+                    WM_SETCURSOR => {
+                        let h = app.hover;
+                        if matches!(
+                            h,
+                            Some(Hit::Open | Hit::Shuffle | Hit::Prev | Hit::Play | Hit::Next | Hit::Minimize)
+                        ) {
+                            if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                                SetCursor(Some(cursor));
+                            }
+                            return LRESULT(1);
+                        }
+                        DefWindowProcW(hwnd, msg, wp, lp)
+                    }
+                    _ => DefWindowProcW(hwnd, msg, wp, lp),
+                }
+            }
+        }
+    }
+}
+
+fn main() -> windows::core::Result<()> {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let instance = GetModuleHandleW(None)?;
+        let class_name = w_ptr("JustMusicWindow");
+
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wndproc),
+            hInstance: HINSTANCE(instance.0),
+            lpszClassName: class_name,
+            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class_name,
+            w_ptr("Just Music"),
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            380,
+            560,
+            None,
+            None,
+            Some(HINSTANCE(instance.0)),
+            None,
+        )?;
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -896,6 +1844,5 @@ mod tests {
     fn time_formatting() {
         assert_eq!(fmt_time(0.0), "0:00");
         assert_eq!(fmt_time(65.9), "1:05");
-        assert_eq!(fmt_time(-3.0), "0:00");
     }
 }

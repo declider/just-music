@@ -18,9 +18,23 @@ A tiny music player for Windows. Load a folder, hit play. Nothing else.
 cargo build --release
 ```
 
-Output: `target/release/just_music.exe`.
+Output: `target/release/just_music.exe` (~2.4 MB). Native Win32/GDI UI, no runtime.
 
-Run `just_music.exe <folder>` to open a folder at startup (otherwise use "Open folder").
+Run `just_music.exe <folder>` to open a folder at startup (otherwise use the folder button).
+
+## Settings
+
+One file: `%APPDATA%\JustMusic\settings.ini` — last folder, volume, shuffle.
+
+## Controls
+
+- Click a track to play it
+- Right-click a track: play next / add to queue
+- Minimize button / tray "Hide": window goes to the taskbar, music keeps playing
+- Window X: hides the window (and its taskbar entry), music keeps playing
+- Tray icon: click to show; right-click for play/pause, previous, next, show, hide, exit
+- Exit is only from the tray menu ("Exit")
+- Space play/pause, arrows seek ±5 s, up/down volume
 
 ## Audio
 
@@ -33,5 +47,8 @@ device mix format, as it does for every app that isn't in exclusive mode.
 
 - Click a track to play it
 - Right-click a track: play next / add to queue
-- "Hide" in the tray menu hides the window; music keeps playing
-- Closing the window exits
+- Minimize button / tray "Hide": window goes to the taskbar, music keeps playing
+- Window X: hides the window (and its taskbar entry), music keeps playing
+- Tray icon: click to show; right-click for play/pause, previous, next, show, hide, exit
+- Exit is only from the tray menu ("Exit")
+- Space play/pause, arrows seek ±5 s, up/down volume
