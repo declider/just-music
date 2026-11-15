@@ -20,6 +20,8 @@ cargo build --release
 
 Output: `target/release/just_music.exe`.
 
+Run `just_music.exe <folder>` to open a folder at startup (otherwise use "Open folder").
+
 ## Audio
 
 Playback is rodio → WASAPI shared mode. No EQ, no filters, no normalisation, no

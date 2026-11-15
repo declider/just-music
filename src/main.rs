@@ -241,7 +241,7 @@ impl App {
             }
         };
 
-        Self {
+        let mut app = Self {
             audio,
             error: None,
             tracks: Vec::new(),
@@ -260,7 +260,17 @@ impl App {
             tray: Tray::new(),
             tray_label_playing: false,
             tray_tooltip: String::new(),
+        };
+
+        // `just_music.exe <folder>` opens that folder right away.
+        if let Some(dir) = std::env::args().nth(1) {
+            let dir = PathBuf::from(dir);
+            if dir.is_dir() {
+                app.load_folder(dir);
+            }
         }
+
+        app
     }
 
     fn load_folder(&mut self, dir: PathBuf) {
