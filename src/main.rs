@@ -383,7 +383,7 @@ impl Layout {
         )
     }
 
-    fn compute(w: i32, h: i32, scale: f32) -> Self {
+    fn compute(w: i32, h: i32, scale: f32, cur_w: i32, tot_w: i32, pct_w: i32) -> Self {
         let s = |v: f32| (v * scale).round() as i32;
         let pad = s(6.0);
         let header_h = s(36.0);
@@ -441,12 +441,21 @@ impl Layout {
         );
 
         // Seek / volume row, aligned with the bottom of the cover.
-        // Small gaps inside the timeline, a wider gap before the volume group.
+        // Labels are measured so each one hugs the element it belongs to:
+        // cover >10px> current >4px> timeline >4px> length >12px> volume >4px> %.
         let seek_y = bar_top + s(56.0);
-        let vol_pct = rect(content_right - s(34.0), seek_y, content_right, seek_y + seek_h);
+        let pct_w = pct_w.max(s(16.0));
+        let cur_w = cur_w.max(s(16.0));
+        let tot_w = tot_w.max(s(16.0));
+        let vol_pct = rect(content_right - pct_w, seek_y, content_right, seek_y + seek_h);
         let vol_bar = rect(vol_pct.left - s(4.0) - s(64.0), seek_y, vol_pct.left - s(4.0), seek_y + seek_h);
-        let cur_time = rect(content_left, seek_y, content_left + s(36.0), seek_y + seek_h);
-        let tot_time = rect(vol_bar.left - s(12.0) - s(36.0), seek_y, vol_bar.left - s(12.0), seek_y + seek_h);
+        let cur_time = rect(content_left, seek_y, content_left + cur_w, seek_y + seek_h);
+        let tot_time = rect(
+            vol_bar.left - s(12.0) - tot_w,
+            seek_y,
+            vol_bar.left - s(12.0),
+            seek_y + seek_h,
+        );
         let seek = rect(
             cur_time.right + s(4.0),
             seek_y,
@@ -563,6 +572,11 @@ struct App {
     scan_count: usize,
     marquee: u32,
 
+    // Measured label widths keep the seek row tight around its text.
+    cur_w: i32,
+    tot_w: i32,
+    pct_w: i32,
+
     cover: Option<Cover>,
     rng: u64,
     dpi_scale: f32,
@@ -608,6 +622,9 @@ impl App {
             scan: None,
             scan_count: 0,
             marquee: 0,
+            cur_w: 0,
+            tot_w: 0,
+            pct_w: 0,
             cover: None,
             rng: seed(),
             dpi_scale: dpi,
@@ -737,7 +754,14 @@ impl App {
         unsafe {
             let _ = GetClientRect(self.hwnd, &mut rc);
         }
-        Layout::compute(rc.right, rc.bottom, self.scale())
+        Layout::compute(
+            rc.right,
+            rc.bottom,
+            self.scale(),
+            self.cur_w,
+            self.tot_w,
+            self.pct_w,
+        )
     }
 
     fn invalidate(&self) {
@@ -1500,6 +1524,10 @@ impl App {
     }
 
     unsafe fn draw(&mut self, hdc: HDC, dirty: RECT) {
+        // Measure the labels first so the seek row can hug them tightly.
+        self.cur_w = text_width(hdc, self.fonts.small, &fmt_time(self.pos)) + 2;
+        self.tot_w = text_width(hdc, self.fonts.small, &fmt_time(self.current_duration())) + 2;
+        self.pct_w = text_width(hdc, self.fonts.small, "100%") + 2;
         let l = self.layout();
         let s = self.scale();
         let hot = |h: Option<Hit>, want: Hit| h == Some(want);
@@ -1682,7 +1710,7 @@ impl App {
                 &fmt_time(self.pos),
                 self.fonts.small,
                 DIM,
-                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             );
             draw_text(
                 hdc,
@@ -1690,7 +1718,7 @@ impl App {
                 &fmt_time(dur),
                 self.fonts.small,
                 DIM,
-                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             );
             let frac = if dur > 0.0 { (self.pos / dur) as f32 } else { 0.0 };
             self.draw_slider(
@@ -1712,7 +1740,7 @@ impl App {
                 &format!("{}%", (self.volume * 100.0).round() as i32),
                 self.fonts.small,
                 DIM,
-                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             );
         }
     }
