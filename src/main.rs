@@ -25,15 +25,16 @@ use player::Audio;
 
 use windows::{
     Win32::{
-        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+        Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
             CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC,
             CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
             DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
             DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
-            EndPaint, FillRect, GetStockObject, HALFTONE, HBRUSH, HDC, HFONT, HGDIOBJ,
-            InvalidateRect, NULL_PEN, ScreenToClient, OUT_TT_PRECIS, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject,
+            EndPaint, FillRect, GetStockObject, GetTextExtentPoint32W, HALFTONE, HBRUSH, HBITMAP,
+            HDC, HFONT, HGDIOBJ, IntersectClipRect, InvalidateRect, NULL_PEN, OUT_TT_PRECIS,
+            PAINTSTRUCT, RestoreDC, RoundRect, SRCCOPY, SaveDC, ScreenToClient, SelectObject,
             SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
             TRANSPARENT, UpdateWindow,
         },
@@ -181,33 +182,85 @@ unsafe fn draw_folder(hdc: HDC, r: RECT, hot: bool, s: f32) {
 
 unsafe fn draw_bar(hdc: HDC, r: RECT, frac: f32, hot: bool, scale: f32) {
     let center = (r.top + r.bottom) / 2;
-    let h = ((if hot { 6.0 } else { 4.0 }) * scale) as i32;
+    let h = ((if hot { 5.0 } else { 3.0 }) * scale).round() as i32;
     let track = RECT {
         left: r.left,
         top: center - h / 2,
         right: r.right,
-        bottom: center + h / 2 + 1,
+        bottom: center - h / 2 + h,
     };
-    round_fill(hdc, track, TRACK_BG, h / 2);
+    round_fill(hdc, track, TRACK_BG, (h / 2).max(1));
 
     let frac = frac.clamp(0.0, 1.0);
-    let right = r.left + ((r.right - r.left) as f32 * frac) as i32;
-    if right > r.left {
+    let knob = ((if hot { 5.0 } else { 4.0 }) * scale).round() as i32;
+    let cx = (r.left + ((r.right - r.left) as f32 * frac) as i32)
+        .clamp(r.left + knob, (r.right - knob).max(r.left + knob));
+    if cx > r.left {
         let done = RECT {
-            right,
+            right: cx,
             ..track
         };
-        round_fill(hdc, done, ACCENT, h / 2);
+        round_fill(hdc, done, ACCENT, (h / 2).max(1));
     }
 
-    let knob = (5.0 * scale) as i32;
-    let brush = CreateSolidBrush(if hot { COLORREF(0x0000_0000) } else { ACCENT });
+    let brush = CreateSolidBrush(TEXT);
     let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
     let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = Ellipse(hdc, right - knob, center - knob, right + knob, center + knob);
+    let _ = Ellipse(hdc, cx - knob, center - knob, cx + knob, center + knob);
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// Draws text clipped to `r`; long strings scroll with a pause at both ends.
+unsafe fn draw_marquee(hdc: HDC, r: RECT, text: &str, font: HFONT, color: COLORREF, scale: f32, tick: u32) {
+    if text.is_empty() {
+        return;
+    }
+    let buf: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+    SelectObject(hdc, old);
+    let avail = (r.right - r.left).max(1);
+    if size.cx <= avail {
+        draw_text(
+            hdc,
+            r,
+            text,
+            font,
+            color,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+        return;
+    }
+
+    // 6px per 200ms tick, ~1.2s pause before and after.
+    let gap = (24.0 * scale) as i32;
+    let travel = size.cx - avail + gap;
+    let scroll_ticks = (travel as f32 / (6.0 * scale)).ceil() as u32;
+    let pause = 6;
+    let t = tick % (pause + scroll_ticks + pause);
+    let offset = if t < pause {
+        0
+    } else if t < pause + scroll_ticks {
+        ((t - pause) as f32 * 6.0 * scale) as i32
+    } else {
+        travel
+    };
+
+    let saved = SaveDC(hdc);
+    IntersectClipRect(hdc, r.left, r.top, r.right, r.bottom);
+    let shifted = rect(r.left - offset, r.top, r.left - offset + size.cx + gap, r.bottom);
+    draw_text(
+        hdc,
+        shifted,
+        text,
+        font,
+        color,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    );
+    let _ = RestoreDC(hdc, saved);
 }
 
 // ---------------------------------------------------------------- layout
@@ -232,7 +285,6 @@ struct Layout {
     cur_time: RECT,
     seek: RECT,
     tot_time: RECT,
-    vol_icon: RECT,
     vol_bar: RECT,
     vol_pct: RECT,
     status: RECT,
@@ -267,8 +319,8 @@ impl Layout {
         let cap_w = s(34.0);
         let search_h = s(24.0);
         let status_h = s(15.0);
-        let bar_h = s(88.0);
-        let cover_sz = bar_h - s(8.0);
+        let bar_h = s(80.0);
+        let cover_sz = s(68.0);
         let ctrl = s(28.0);
         let seek_h = s(18.0);
         let row_h = s(26.0);
@@ -287,48 +339,42 @@ impl Layout {
 
         let bar_top = (h - status_h - bar_h).max(header_h + row_h);
         let bar = rect(0, bar_top, w, bar_top + bar_h);
-        let list = rect(
-            pad,
-            header_h + s(4.0),
-            w - pad,
-            bar_top - s(4.0).max(header_h + row_h + 1),
-        );
+        let list = rect(pad, header_h + s(4.0), w - pad, bar_top);
 
         let cover = rect(
             pad,
-            bar_top + s(4.0),
+            bar_top + s(6.0),
             pad + cover_sz,
-            bar_top + s(4.0) + cover_sz,
+            bar_top + s(6.0) + cover_sz,
         );
         let content_left = cover.right + s(10.0);
         let content_right = w - pad;
 
         // Track / transport row.
-        let next_rc = rect(content_right - ctrl, bar_top + s(8.0), content_right, bar_top + s(8.0) + ctrl);
+        let next_rc = rect(content_right - ctrl, bar_top + s(14.0), content_right, bar_top + s(14.0) + ctrl);
         let play = rect(next_rc.left - s(6.0) - ctrl, next_rc.top, next_rc.left - s(6.0), next_rc.bottom);
         let prev = rect(play.left - s(6.0) - ctrl, next_rc.top, play.left - s(6.0), next_rc.bottom);
         let shuffle = rect(prev.left - s(10.0) - ctrl, next_rc.top, prev.left - s(10.0), next_rc.bottom);
 
         let title = rect(
             content_left,
-            bar_top + s(7.0),
+            bar_top + s(10.0),
             (shuffle.left - s(10.0)).max(content_left + s(20.0)),
-            bar_top + s(28.0),
+            bar_top + s(29.0),
         );
         let artist = rect(
             content_left,
-            bar_top + s(29.0),
+            bar_top + s(30.0),
             title.right,
-            bar_top + s(46.0),
+            bar_top + s(47.0),
         );
 
-        // Seek / volume row.
-        let seek_y = bar_top + s(50.0);
+        // Seek / volume row, aligned with the bottom of the cover.
+        let seek_y = bar_top + s(56.0);
         let vol_pct = rect(content_right - s(34.0), seek_y, content_right, seek_y + seek_h);
         let vol_bar = rect(vol_pct.left - s(6.0) - s(64.0), seek_y, vol_pct.left - s(6.0), seek_y + seek_h);
-        let vol_icon = rect(vol_bar.left - s(18.0), seek_y, vol_bar.left - s(2.0), seek_y + seek_h);
         let cur_time = rect(content_left, seek_y, content_left + s(34.0), seek_y + seek_h);
-        let tot_time = rect(vol_icon.left - s(8.0) - s(34.0), seek_y, vol_icon.left - s(8.0), seek_y + seek_h);
+        let tot_time = rect(vol_bar.left - s(6.0) - s(34.0), seek_y, vol_bar.left - s(6.0), seek_y + seek_h);
         let seek = rect(
             cur_time.right + s(6.0),
             seek_y,
@@ -355,7 +401,6 @@ impl Layout {
             cur_time,
             seek,
             tot_time,
-            vol_icon,
             vol_bar,
             vol_pct,
             status: rect(pad, h - status_h, w - pad, h - s(2.0)),
@@ -403,6 +448,7 @@ enum Drag {
     None,
     Seek,
     Volume,
+    Scroll,
 }
 
 struct Scan {
@@ -444,10 +490,17 @@ struct App {
     scan: Option<Scan>,
     scan_count: usize,
     anim: u32,
+    marquee: u32,
 
     cover: Option<Cover>,
     rng: u64,
     dpi_scale: f32,
+
+    buf_dc: HDC,
+    buf_bmp: HBITMAP,
+    buf_old: HGDIOBJ,
+    buf_w: i32,
+    buf_h: i32,
 
     tray: bool,
     tray_tip: String,
@@ -482,9 +535,15 @@ impl App {
             scan: None,
             scan_count: 0,
             anim: 0,
+            marquee: 0,
             cover: None,
             rng: seed(),
             dpi_scale: dpi,
+            buf_dc: HDC::default(),
+            buf_bmp: HBITMAP::default(),
+            buf_old: HGDIOBJ::default(),
+            buf_w: 0,
+            buf_h: 0,
             tray: false,
             tray_tip: String::new(),
         };
@@ -711,6 +770,7 @@ impl App {
                 self.current = Some(idx);
                 self.pos = 0.0;
                 self.playing = true;
+                self.marquee = 0;
                 self.error = None;
                 unsafe {
                     self.load_cover();
@@ -880,6 +940,7 @@ impl App {
 
     fn tick(&mut self) {
         self.anim = self.anim.wrapping_add(1);
+        self.marquee = self.marquee.wrapping_add(1);
         self.poll_scan();
 
         let finished = self.current.is_some() && self.audio.as_ref().is_some_and(|a| a.finished());
@@ -960,7 +1021,12 @@ impl App {
                 _ => {}
             }
         }
-        if y < l.header.bottom && !inside(l.search, x, y) && self.hit_test(x, y).is_none() {
+        if y < l.header.bottom {
+            if !inside(l.search, x, y) && self.hit_test(x, y).is_none() {
+                return HTCAPTION;
+            }
+        } else if y >= l.bar.top && self.hit_test(x, y).is_none() {
+            // The compact header is hard to grab, so the player bar drags the window too.
             return HTCAPTION;
         }
         HTCLIENT
@@ -1000,7 +1066,8 @@ impl App {
         }
         if inside(l.list, x, y) {
             if x >= l.list.right - l.scrollbar {
-                return Some(Hit::Scroll);
+                let rows = ((l.list.bottom - l.list.top) / l.row_h).max(1) as usize;
+                return (self.visible.len() > rows).then_some(Hit::Scroll);
             }
             let row = self.scroll + ((y - l.list.top) / l.row_h) as usize;
             if row < self.visible.len() {
@@ -1035,8 +1102,11 @@ impl App {
             return;
         }
         let height = (l.list.bottom - l.list.top).max(1);
-        let frac = ((y - l.list.top) as f32 / height as f32).clamp(0.0, 1.0);
-        self.scroll = (frac * max_scroll as f32) as usize;
+        let thumb_h = (((rows as f32 / total as f32) * height as f32).max(20.0) as i32).min(height);
+        let span = (height - thumb_h).max(1);
+        // Centre the thumb under the cursor so grabbing it doesn't jump.
+        let frac = ((y - l.list.top - thumb_h / 2) as f32 / span as f32).clamp(0.0, 1.0);
+        self.scroll = (frac * max_scroll as f32).round() as usize;
         self.invalidate();
     }
 
@@ -1048,6 +1118,10 @@ impl App {
             }
             Drag::Volume => {
                 self.volume_from_x(x);
+                return;
+            }
+            Drag::Scroll => {
+                self.scroll_from_y(y);
                 return;
             }
             Drag::None => {}
@@ -1101,13 +1175,24 @@ impl App {
                 }
                 self.volume_from_x(x);
             }
-            Some(Hit::Scroll) => self.scroll_from_y(y),
-            Some(Hit::Row(row)) => {
-                if let Some(&idx) = self.visible.get(row) {
-                    self.play_index(idx);
+            Some(Hit::Scroll) => {
+                self.drag = Drag::Scroll;
+                unsafe {
+                    SetCapture(self.hwnd);
                 }
+                self.scroll_from_y(y);
             }
+            // Single click only hovers; playing on double click avoids accidental track changes.
+            Some(Hit::Row(_)) => {}
             None => {}
+        }
+    }
+
+    fn on_double_click(&mut self, x: i32, y: i32) {
+        if let Some(Hit::Row(row)) = self.hit_test(x, y)
+            && let Some(&idx) = self.visible.get(row)
+        {
+            self.play_index(idx);
         }
     }
 
@@ -1115,7 +1200,7 @@ impl App {
         match self.drag {
             Drag::Seek => self.seek_to(self.pos),
             Drag::Volume => self.save_settings(),
-            Drag::None => {}
+            Drag::None | Drag::Scroll => {}
         }
         if self.drag != Drag::None {
             unsafe {
@@ -1261,18 +1346,36 @@ impl App {
             return;
         }
 
-        let mem = unsafe { CreateCompatibleDC(Some(hdc)) };
-        let bmp = unsafe { CreateCompatibleBitmap(hdc, rc.right, rc.bottom) };
-        let old = unsafe { SelectObject(mem, HGDIOBJ(bmp.0)) };
-
-        unsafe { self.draw(mem, rc) };
+        self.ensure_buffer(hdc, rc.right, rc.bottom);
 
         unsafe {
-            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(mem), 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-            let _ = DeleteObject(HGDIOBJ(bmp.0));
-            let _ = DeleteDC(mem);
+            self.draw(self.buf_dc, rc);
+            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(self.buf_dc), 0, 0, SRCCOPY);
             let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
+    /// Back buffer survives repaints; only a resize recreates it.
+    fn ensure_buffer(&mut self, hdc: HDC, w: i32, h: i32) {
+        if self.buf_w == w && self.buf_h == h && !self.buf_dc.0.is_null() {
+            return;
+        }
+        unsafe {
+            if !self.buf_dc.0.is_null() {
+                if !self.buf_old.0.is_null() {
+                    SelectObject(self.buf_dc, self.buf_old);
+                }
+                let _ = DeleteObject(HGDIOBJ(self.buf_bmp.0));
+                let _ = DeleteDC(self.buf_dc);
+            }
+            let dc = CreateCompatibleDC(Some(hdc));
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old = SelectObject(dc, HGDIOBJ(bmp.0));
+            self.buf_dc = dc;
+            self.buf_bmp = bmp;
+            self.buf_old = old;
+            self.buf_w = w;
+            self.buf_h = h;
         }
     }
 
@@ -1368,13 +1471,14 @@ impl App {
                 Some(t) => (t.title.clone(), t.artist.clone()),
                 None => ("Nothing playing".to_string(), String::new()),
             };
-            draw_text(
+            draw_marquee(
                 hdc,
                 l.title,
                 &title,
                 self.fonts.bold,
                 if self.current.is_some() { TEXT } else { DIM },
-                DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+                s,
+                self.marquee,
             );
             draw_text(
                 hdc,
@@ -1458,7 +1562,6 @@ impl App {
                 s,
             );
 
-            draw_glyph(hdc, l.vol_icon, "\u{E767}", self.fonts.icons, DIM);
             draw_bar(
                 hdc,
                 l.vol_bar,
@@ -1544,17 +1647,7 @@ impl App {
                 }
 
                 let track = &self.tracks[idx];
-                let mut left = row.left + (7.0 * s) as i32;
-                if is_current {
-                    let bar = rect(
-                        left,
-                        row.top + (5.0 * s) as i32,
-                        left + (2.0 * s).max(1.0) as i32,
-                        row.bottom - (5.0 * s) as i32,
-                    );
-                    fill(hdc, bar, ACCENT);
-                    left += (8.0 * s) as i32;
-                }
+                let left = row.left + (7.0 * s) as i32;
 
                 let artist_w = (((row.right - row.left) as f32) * 0.38)
                     .min(150.0 * s)
@@ -1564,7 +1657,7 @@ impl App {
                     hdc,
                     title_rc,
                     &track.title,
-                    if is_current { self.fonts.bold } else { self.fonts.ui },
+                    self.fonts.ui,
                     TEXT,
                     DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                 );
@@ -1621,6 +1714,13 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
+            if !self.buf_dc.0.is_null() {
+                if !self.buf_old.0.is_null() {
+                    SelectObject(self.buf_dc, self.buf_old);
+                }
+                let _ = DeleteObject(HGDIOBJ(self.buf_bmp.0));
+                let _ = DeleteDC(self.buf_dc);
+            }
             if let Some(cover) = self.cover.take() {
                 let _ = DeleteObject(HGDIOBJ(cover.bmp.0));
             }
@@ -1786,12 +1886,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WM_ERASEBKGND => LRESULT(1),
                     WM_TIMER => {
                         app.tick();
-                        if IsWindowVisible(hwnd).as_bool() {
+                        // Idle UI is static; only repaint while something is moving.
+                        if (app.playing || app.scan.is_some()) && IsWindowVisible(hwnd).as_bool() {
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                         LRESULT(0)
                     }
                     WM_SIZE => {
+                        if wp.0 as u32 == SIZE_MINIMIZED {
+                            trim_working_set();
+                        }
                         let l = app.layout();
                         let edit = l.edit_rect(app.scale());
                         let w = (edit.right - edit.left).max(10);
@@ -1842,6 +1946,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let x = (lp.0 & 0xffff) as i16 as i32;
                         let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
                         app.on_mouse_down(x, y);
+                        LRESULT(0)
+                    }
+                    WM_LBUTTONDBLCLK => {
+                        let x = (lp.0 & 0xffff) as i16 as i32;
+                        let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
+                        app.on_double_click(x, y);
                         LRESULT(0)
                     }
                     WM_LBUTTONUP => {
@@ -1897,6 +2007,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WM_CLOSE => {
                         // Closing hides to tray; exit lives in the tray menu.
                         let _ = ShowWindow(hwnd, SW_HIDE);
+                        trim_working_set();
                         LRESULT(0)
                     }
                     WM_GETMINMAXINFO => {
@@ -1944,7 +2055,7 @@ fn main() -> windows::core::Result<()> {
         let class_name = w_ptr("JustMusicWindow");
 
         let wc = WNDCLASSW {
-            style: CS_HREDRAW | CS_VREDRAW,
+            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
             lpfnWndProc: Some(wndproc),
             hInstance: HINSTANCE(instance.0),
             lpszClassName: class_name,
