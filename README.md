@@ -4,13 +4,15 @@ A tiny music player for Windows. Load a folder, hit play. Nothing else.
 
 ## Features
 
-- Folder as playlist (recursive scan), title + artist from tags, cover of the current track
+- Folder as playlist (recursive scan, on a worker thread), title + artist from tags, cover of the current track
 - FLAC, MP3, WAV, OGG/Vorbis, M4A/AAC
-- Search by title or artist
+- Search by title or artist in the title bar
 - Shuffle, "play next" / "add to queue" via right-click
-- Volume and seek sliders
+- Volume and seek sliders (volume shows its %)
+- Borderless window with custom title bar: folder, search, minimise / maximise / close
+- Player bar: cover, title/artist, transport + shuffle, seek, volume
 - Tray icon: play/pause, previous, next, show, hide, exit
-- Dark theme, compact window
+- Dark theme, compact layout
 
 ## Build
 

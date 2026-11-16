@@ -33,15 +33,23 @@ use windows::{
             DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
             DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
             EndPaint, FillRect, GetStockObject, HALFTONE, HBRUSH, HDC, HFONT, HGDIOBJ,
-            InvalidateRect, NULL_PEN, OUT_TT_PRECIS, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject,
+            InvalidateRect, NULL_PEN, ScreenToClient, OUT_TT_PRECIS, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject,
             SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
             TRANSPARENT, UpdateWindow,
         },
-        Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{GetCurrentProcess, SetProcessWorkingSetSize},
+        },
         UI::{
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext},
-            Input::KeyboardAndMouse::{GetFocus, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE, VK_UP},
+            HiDpi::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, GetSystemMetricsForDpi,
+                SetProcessDpiAwarenessContext,
+            },
+            Input::KeyboardAndMouse::{
+                GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE,
+                VK_UP,
+            },
             Shell::{
                 NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
                 NOTIFYICONDATAW, NOTIFYICON_VERSION_4, Shell_NotifyIconW,
@@ -80,6 +88,7 @@ const CMD_QUEUE_CLEAR: usize = 202;
 
 const EM_SETCUEBANNER: u32 = 0x1501;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
+const EM_SETRECT: u32 = 0x00B3;
 const EN_CHANGE_CODE: u32 = 0x0300;
 
 struct Fonts {
@@ -91,10 +100,11 @@ struct Fonts {
 
 impl Fonts {
     unsafe fn new(dpi: i32) -> Self {
-        let h = |pt: i32| -(pt * dpi / 72);
-        let make = |pt: i32, weight: i32, face: PCWSTR| unsafe {
+        // Pixel heights (not points) so text lands on whole pixels at 100% and scales cleanly.
+        let h = |px: i32| -(px * dpi / 96).max(9);
+        let make = |px: i32, weight: i32, face: PCWSTR| unsafe {
             CreateFontW(
-                h(pt),
+                h(px),
                 0,
                 0,
                 0,
@@ -111,10 +121,10 @@ impl Fonts {
             )
         };
         Self {
-            ui: make(9, 400, w_ptr("Segoe UI")),
-            bold: make(9, 600, w_ptr("Segoe UI")),
-            small: make(8, 400, w_ptr("Segoe UI")),
-            icons: make(11, 400, w_ptr("Segoe MDL2 Assets")),
+            ui: make(14, 400, w_ptr("Segoe UI")),
+            bold: make(14, 600, w_ptr("Segoe UI")),
+            small: make(11, 400, w_ptr("Segoe UI")),
+            icons: make(18, 400, w_ptr("Segoe MDL2 Assets")),
         }
     }
 }
@@ -161,8 +171,8 @@ unsafe fn draw_glyph(hdc: HDC, r: RECT, glyph: &str, font: HFONT, color: COLORRE
 /// Folder silhouette for the "open folder" button (no MDL2 glyph needed).
 unsafe fn draw_folder(hdc: HDC, r: RECT, hot: bool, s: f32) {
     let color = if hot { TEXT } else { DIM };
-    let w = (14.0 * s) as i32;
-    let h = (11.0 * s) as i32;
+    let w = (16.0 * s) as i32;
+    let h = (13.0 * s) as i32;
     let left = (r.left + r.right - w) / 2;
     let top = (r.top + r.bottom - h) / 2;
     fill(hdc, rect(left, top, left + w / 2, top + (4.0 * s) as i32), color);
@@ -204,21 +214,27 @@ unsafe fn draw_bar(hdc: HDC, r: RECT, frac: f32, hot: bool, scale: f32) {
 
 #[derive(Clone, Copy)]
 struct Layout {
-    search: RECT,
+    header: RECT,
     open: RECT,
-    shuffle: RECT,
+    search: RECT,
+    min_btn: RECT,
+    max_btn: RECT,
+    close_btn: RECT,
     list: RECT,
+    bar: RECT,
     cover: RECT,
-    seek: RECT,
-    cur_time: RECT,
-    tot_time: RECT,
+    title: RECT,
+    artist: RECT,
+    shuffle: RECT,
     prev: RECT,
     play: RECT,
     next: RECT,
+    cur_time: RECT,
+    seek: RECT,
+    tot_time: RECT,
     vol_icon: RECT,
     vol_bar: RECT,
     vol_pct: RECT,
-    min_btn: RECT,
     status: RECT,
     row_h: i32,
     scrollbar: i32,
@@ -234,83 +250,115 @@ fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
 }
 
 impl Layout {
+    fn edit_rect(&self, s: f32) -> RECT {
+        rect(
+            self.search.left + (22.0 * s) as i32,
+            self.search.top,
+            self.search.right - (6.0 * s) as i32,
+            self.search.bottom,
+        )
+    }
+
     fn compute(w: i32, h: i32, scale: f32) -> Self {
-        let s = |v: f32| (v * scale) as i32;
-        let pad = s(10.0);
-        let btn = s(26.0);
-        let ctrl_h = s(30.0);
-        let seek_h = s(18.0);
-        let info_h = s(46.0);
+        let s = |v: f32| (v * scale).round() as i32;
+        let pad = s(6.0);
+        let header_h = s(36.0);
+        let open = s(24.0);
+        let cap_w = s(34.0);
+        let search_h = s(24.0);
         let status_h = s(15.0);
+        let bar_h = s(88.0);
+        let cover_sz = bar_h - s(8.0);
+        let ctrl = s(28.0);
+        let seek_h = s(18.0);
         let row_h = s(26.0);
 
-        let open = rect(pad, pad, pad + btn, pad + btn);
-        let shuffle = rect(w - pad - btn, pad, w - pad, pad + btn);
+        let header = rect(0, 0, w, header_h);
+        let open_rc = rect(pad, (header_h - open) / 2, pad + open, (header_h + open) / 2);
+        let close_btn = rect(w - cap_w, 0, w, header_h);
+        let max_btn = rect(w - cap_w * 2, 0, w - cap_w, header_h);
+        let min_btn = rect(w - cap_w * 3, 0, w - cap_w * 2, header_h);
         let search = rect(
-            open.right + s(8.0),
-            pad,
-            shuffle.left - s(8.0),
-            pad + btn,
+            open_rc.right + s(6.0),
+            (header_h - search_h) / 2,
+            min_btn.left - s(6.0),
+            (header_h + search_h) / 2,
         );
 
-        let list_top = pad + btn + s(8.0);
-        let bottom_h = status_h + ctrl_h + seek_h + info_h + s(10.0);
-        let bottom_top = h - bottom_h;
+        let bar_top = (h - status_h - bar_h).max(header_h + row_h);
+        let bar = rect(0, bar_top, w, bar_top + bar_h);
+        let list = rect(
+            pad,
+            header_h + s(4.0),
+            w - pad,
+            bar_top - s(4.0).max(header_h + row_h + 1),
+        );
 
-        let cover = rect(pad, bottom_top + s(2.0), pad + info_h - s(2.0), bottom_top + info_h);
+        let cover = rect(
+            pad,
+            bar_top + s(4.0),
+            pad + cover_sz,
+            bar_top + s(4.0) + cover_sz,
+        );
+        let content_left = cover.right + s(10.0);
+        let content_right = w - pad;
 
-        let seek_y = bottom_top + info_h + s(4.0);
-        let cur_time = rect(pad, seek_y, pad + s(38.0), seek_y + seek_h);
-        let tot_time = rect(w - pad - s(38.0), seek_y, w - pad, seek_y + seek_h);
+        // Track / transport row.
+        let next_rc = rect(content_right - ctrl, bar_top + s(8.0), content_right, bar_top + s(8.0) + ctrl);
+        let play = rect(next_rc.left - s(6.0) - ctrl, next_rc.top, next_rc.left - s(6.0), next_rc.bottom);
+        let prev = rect(play.left - s(6.0) - ctrl, next_rc.top, play.left - s(6.0), next_rc.bottom);
+        let shuffle = rect(prev.left - s(10.0) - ctrl, next_rc.top, prev.left - s(10.0), next_rc.bottom);
+
+        let title = rect(
+            content_left,
+            bar_top + s(7.0),
+            (shuffle.left - s(10.0)).max(content_left + s(20.0)),
+            bar_top + s(28.0),
+        );
+        let artist = rect(
+            content_left,
+            bar_top + s(29.0),
+            title.right,
+            bar_top + s(46.0),
+        );
+
+        // Seek / volume row.
+        let seek_y = bar_top + s(50.0);
+        let vol_pct = rect(content_right - s(34.0), seek_y, content_right, seek_y + seek_h);
+        let vol_bar = rect(vol_pct.left - s(6.0) - s(64.0), seek_y, vol_pct.left - s(6.0), seek_y + seek_h);
+        let vol_icon = rect(vol_bar.left - s(18.0), seek_y, vol_bar.left - s(2.0), seek_y + seek_h);
+        let cur_time = rect(content_left, seek_y, content_left + s(34.0), seek_y + seek_h);
+        let tot_time = rect(vol_icon.left - s(8.0) - s(34.0), seek_y, vol_icon.left - s(8.0), seek_y + seek_h);
         let seek = rect(
             cur_time.right + s(6.0),
             seek_y,
-            tot_time.left - s(6.0),
+            (tot_time.left - s(6.0)).max(cur_time.right + s(20.0)),
             seek_y + seek_h,
         );
 
-        let ctrl_y = seek_y + seek_h + s(2.0);
-        let prev = rect(pad, ctrl_y, pad + ctrl_h, ctrl_y + ctrl_h);
-        let play = rect(
-            prev.right + s(8.0),
-            ctrl_y,
-            prev.right + s(8.0) + ctrl_h,
-            ctrl_y + ctrl_h,
-        );
-        let next = rect(
-            play.right + s(8.0),
-            ctrl_y,
-            play.right + s(8.0) + ctrl_h,
-            ctrl_y + ctrl_h,
-        );
-
-        let min_btn = rect(
-            w - pad - btn,
-            ctrl_y + (ctrl_h - btn) / 2,
-            w - pad,
-            ctrl_y + (ctrl_h - btn) / 2 + btn,
-        );
-        let vol_pct = rect(min_btn.left - s(40.0), ctrl_y, min_btn.left - s(6.0), ctrl_y + ctrl_h);
-        let vol_bar = rect(vol_pct.left - s(92.0), ctrl_y, vol_pct.left - s(8.0), ctrl_y + ctrl_h);
-        let vol_icon = rect(vol_bar.left - s(20.0), ctrl_y, vol_bar.left - s(4.0), ctrl_y + ctrl_h);
-
         Self {
+            header,
+            open: open_rc,
             search,
-            open,
-            shuffle,
-            list: rect(pad, list_top, w - pad, (bottom_top - s(6.0)).max(list_top + row_h)),
+            min_btn,
+            max_btn,
+            close_btn,
+            list,
+            bar,
             cover,
-            seek,
-            cur_time,
-            tot_time,
+            title,
+            artist,
+            shuffle,
             prev,
             play,
-            next,
+            next: next_rc,
+            cur_time,
+            seek,
+            tot_time,
             vol_icon,
             vol_bar,
             vol_pct,
-            min_btn,
-            status: rect(pad, h - status_h - s(2.0), w - pad, h - s(2.0)),
+            status: rect(pad, h - status_h, w - pad, h - s(2.0)),
             row_h,
             scrollbar: s(8.0),
         }
@@ -319,6 +367,17 @@ impl Layout {
 
 fn inside(r: RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+fn expand(r: RECT, d: i32) -> RECT {
+    rect(r.left - d, r.top - d, r.right + d, r.bottom + d)
+}
+
+/// Bars are only grabbable near their visible 4-6px line, not the whole row.
+fn bar_hit(r: RECT, x: i32, y: i32, s: f32) -> bool {
+    x >= r.left - (3.0 * s) as i32
+        && x <= r.right + (3.0 * s) as i32
+        && (y - (r.top + r.bottom) / 2).abs() <= (4.0 * s) as i32 + 1
 }
 
 // ---------------------------------------------------------------- app state
@@ -330,7 +389,9 @@ enum Hit {
     Prev,
     Play,
     Next,
-    Minimize,
+    Min,
+    Max,
+    Close,
     Seek,
     Volume,
     Scroll,
@@ -395,15 +456,6 @@ struct App {
 impl App {
     unsafe fn new(hwnd: HWND) -> Self {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
-        let dark = windows::core::BOOL::from(true);
-        unsafe {
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &dark as *const _ as *const c_void,
-                std::mem::size_of::<windows::core::BOOL>() as u32,
-            );
-        }
         let settings = Settings::load();
 
         let mut app = Self {
@@ -411,7 +463,7 @@ impl App {
             edit: HWND::default(),
             icon: HICON::default(),
             fonts: unsafe { Fonts::new((96.0 * dpi) as i32) },
-            brush_input: unsafe { CreateSolidBrush(PANEL) },
+            brush_input: unsafe { CreateSolidBrush(BG) },
             audio: Audio::open().ok(),
             error: None,
             tracks: Vec::new(),
@@ -502,7 +554,7 @@ impl App {
             SendMessageW(
                 edit,
                 EM_SETCUEBANNER,
-                Some(WPARAM(1)),
+                Some(WPARAM(0)),
                 Some(LPARAM(w_ptr("Search title or artist").0 as isize)),
             );
             SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(256)), Some(LPARAM(0)));
@@ -614,6 +666,7 @@ impl App {
                 self.scan_count = self.tracks.len();
                 self.refilter();
                 self.invalidate();
+                trim_working_set();
             }
             Err(TryRecvError::Empty) => {
                 self.scan_count = scan.count.load(Ordering::Relaxed);
@@ -835,7 +888,7 @@ impl App {
             return;
         }
         if let Some(audio) = &self.audio {
-            if self.current.is_some() {
+            if self.current.is_some() && self.drag != Drag::Seek {
                 self.pos = audio.position().as_secs_f64();
             }
             self.playing = self.current.is_some() && !audio.is_paused();
@@ -882,8 +935,48 @@ impl App {
 
     // ------------------------------------------------ input
 
+    /// Non-client hit test for the borderless window: resize edges + draggable header.
+    fn nchit(&self, x: i32, y: i32) -> u32 {
+        let l = self.layout();
+        let b = (5.0 * self.scale()) as i32;
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut rc);
+        }
+        if !unsafe { IsZoomed(self.hwnd) }.as_bool() {
+            let left = x < b;
+            let right = x >= rc.right - b;
+            let top = y < b;
+            let bottom = y >= rc.bottom - b;
+            match (top, bottom, left, right) {
+                (true, _, true, _) => return HTTOPLEFT,
+                (true, _, _, true) => return HTTOPRIGHT,
+                (_, true, true, _) => return HTBOTTOMLEFT,
+                (_, true, _, true) => return HTBOTTOMRIGHT,
+                (true, _, _, _) => return HTTOP,
+                (_, true, _, _) => return HTBOTTOM,
+                (_, _, true, _) => return HTLEFT,
+                (_, _, _, true) => return HTRIGHT,
+                _ => {}
+            }
+        }
+        if y < l.header.bottom && !inside(l.search, x, y) && self.hit_test(x, y).is_none() {
+            return HTCAPTION;
+        }
+        HTCLIENT
+    }
+
     fn hit_test(&self, x: i32, y: i32) -> Option<Hit> {
         let l = self.layout();
+        if inside(l.close_btn, x, y) {
+            return Some(Hit::Close);
+        }
+        if inside(l.max_btn, x, y) {
+            return Some(Hit::Max);
+        }
+        if inside(l.min_btn, x, y) {
+            return Some(Hit::Min);
+        }
         if inside(l.open, x, y) {
             return Some(Hit::Open);
         }
@@ -899,13 +992,10 @@ impl App {
         if inside(l.next, x, y) {
             return Some(Hit::Next);
         }
-        if inside(l.min_btn, x, y) {
-            return Some(Hit::Minimize);
-        }
-        if inside(l.seek, x, y) {
+        if bar_hit(l.seek, x, y, self.scale()) {
             return Some(Hit::Seek);
         }
-        if inside(l.vol_bar, x, y) {
+        if bar_hit(l.vol_bar, x, y, self.scale()) {
             return Some(Hit::Volume);
         }
         if inside(l.list, x, y) {
@@ -984,15 +1074,31 @@ impl App {
             Some(Hit::Prev) => self.prev_track(),
             Some(Hit::Play) => self.toggle_play(),
             Some(Hit::Next) => self.next_track(true),
-            Some(Hit::Minimize) => unsafe {
+            Some(Hit::Min) => unsafe {
                 let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+            },
+            Some(Hit::Max) => unsafe {
+                if IsZoomed(self.hwnd).as_bool() {
+                    let _ = ShowWindow(self.hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(self.hwnd, SW_MAXIMIZE);
+                }
+            },
+            Some(Hit::Close) => unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             },
             Some(Hit::Seek) => {
                 self.drag = Drag::Seek;
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
                 self.seek_from_x(x);
             }
             Some(Hit::Volume) => {
                 self.drag = Drag::Volume;
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
                 self.volume_from_x(x);
             }
             Some(Hit::Scroll) => self.scroll_from_y(y),
@@ -1010,6 +1116,11 @@ impl App {
             Drag::Seek => self.seek_to(self.pos),
             Drag::Volume => self.save_settings(),
             Drag::None => {}
+        }
+        if self.drag != Drag::None {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
         }
         self.drag = Drag::None;
     }
@@ -1168,55 +1279,65 @@ impl App {
     unsafe fn draw(&mut self, hdc: HDC, rc: RECT) {
         let l = self.layout();
         let s = self.scale();
+        let hot = |h: Option<Hit>, want: Hit| h == Some(want);
 
         unsafe {
             fill(hdc, rc, BG);
 
-            // --- toolbar
-            let hot = |h: Option<Hit>, want: Hit| h == Some(want);
+            // --- title bar: open + search + window buttons
+            fill(hdc, l.header, PANEL);
+
             round_fill(
                 hdc,
                 l.open,
-                if hot(self.hover, Hit::Open) { HOVER } else { BG },
+                if hot(self.hover, Hit::Open) { HOVER } else { PANEL },
                 (4.0 * s) as i32,
             );
             draw_folder(hdc, l.open, hot(self.hover, Hit::Open), s);
 
-            round_fill(
-                hdc,
-                l.shuffle,
-                if self.shuffle {
-                    SEL
-                } else if hot(self.hover, Hit::Shuffle) {
-                    HOVER
-                } else {
-                    BG
-                },
-                (4.0 * s) as i32,
-            );
+            let focused = GetFocus() == self.edit;
+            fill(hdc, expand(l.search, (1.0 * s) as i32), if focused { ACCENT } else { TRACK_BG });
+            fill(hdc, l.search, BG);
             draw_glyph(
                 hdc,
-                l.shuffle,
-                "\u{E8B1}",
+                rect(l.search.left, l.search.top, l.search.left + (22.0 * s) as i32, l.search.bottom),
+                "\u{E721}",
                 self.fonts.icons,
-                if self.shuffle { ACCENT } else { DIM },
+                DIM,
             );
 
-            let focused = GetFocus() == self.edit;
-            let mut field = l.search;
-            field.top -= (1.0 * s) as i32;
-            field.bottom += (1.0 * s) as i32;
-            round_fill(hdc, field, PANEL, (4.0 * s) as i32);
-            if focused {
-                // 1px accent ring
-                fill(hdc, rect(field.left, field.bottom - (1.0 * s).max(1.0) as i32, field.right, field.bottom), ACCENT);
+            // Window buttons.
+            for (r, hovered) in [
+                (l.min_btn, hot(self.hover, Hit::Min)),
+                (l.max_btn, hot(self.hover, Hit::Max)),
+                (l.close_btn, hot(self.hover, Hit::Close)),
+            ] {
+                if hovered {
+                    fill(hdc, r, if r == l.close_btn { COLORREF(0x001c_2bc4) } else { HOVER });
+                }
             }
+            draw_glyph(hdc, l.min_btn, "\u{E921}", self.fonts.icons, TEXT);
+            draw_glyph(
+                hdc,
+                l.max_btn,
+                if IsZoomed(self.hwnd).as_bool() { "\u{E923}" } else { "\u{E922}" },
+                self.fonts.icons,
+                TEXT,
+            );
+            draw_glyph(hdc, l.close_btn, "\u{E8BB}", self.fonts.icons, TEXT);
 
-            // --- list
+            fill(
+                hdc,
+                rect(0, l.header.bottom - 1, rc.right, l.header.bottom),
+                COLORREF(0x0030_2a26),
+            );
+
+            // --- playlist
             self.draw_list(hdc, &l, s);
 
-            // --- bottom
-            fill(hdc, rect(rc.left, l.cover.top - (4.0 * s) as i32, rc.right, l.cover.top - (4.0 * s) as i32 + 1), COLORREF(0x0030_2a26));
+            // --- player bar
+            fill(hdc, l.bar, PANEL);
+            fill(hdc, rect(0, l.bar.top, rc.right, l.bar.top + 1), COLORREF(0x0030_2a26));
 
             if let Some(cover) = &self.cover {
                 let mem = CreateCompatibleDC(Some(hdc));
@@ -1239,41 +1360,78 @@ impl App {
                 SelectObject(mem, old);
                 let _ = DeleteDC(mem);
             } else {
-                round_fill(hdc, l.cover, PANEL, (4.0 * s) as i32);
+                fill(hdc, l.cover, BG);
                 draw_glyph(hdc, l.cover, "\u{E8D6}", self.fonts.icons, DIM);
             }
 
-            let info = rect(
-                l.cover.right + (10.0 * s) as i32,
-                l.cover.top + (3.0 * s) as i32,
-                l.list.right,
-                l.cover.bottom,
-            );
             let (title, artist) = match self.current.and_then(|i| self.tracks.get(i)) {
                 Some(t) => (t.title.clone(), t.artist.clone()),
                 None => ("Nothing playing".to_string(), String::new()),
             };
-            let mut title_rc = info;
-            title_rc.bottom -= (14.0 * s) as i32;
             draw_text(
                 hdc,
-                title_rc,
+                l.title,
                 &title,
                 self.fonts.bold,
                 if self.current.is_some() { TEXT } else { DIM },
                 DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
             );
-            let artist_rc = rect(info.left, info.bottom - (16.0 * s) as i32, info.right, info.bottom);
             draw_text(
                 hdc,
-                artist_rc,
+                l.artist,
                 &artist,
                 self.fonts.small,
                 DIM,
                 DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
             );
 
-            // seek
+            // Transport.
+            round_fill(
+                hdc,
+                l.shuffle,
+                if self.shuffle {
+                    SEL
+                } else if hot(self.hover, Hit::Shuffle) {
+                    HOVER
+                } else {
+                    PANEL
+                },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(
+                hdc,
+                l.shuffle,
+                "\u{E8B1}",
+                self.fonts.icons,
+                if self.shuffle { ACCENT } else { DIM },
+            );
+
+            round_fill(
+                hdc,
+                l.prev,
+                if hot(self.hover, Hit::Prev) { HOVER } else { PANEL },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(hdc, l.prev, "\u{E892}", self.fonts.icons, TEXT);
+
+            round_fill(hdc, l.play, COLORREF(0x0032_2418), (4.0 * s) as i32);
+            draw_glyph(
+                hdc,
+                l.play,
+                if self.playing { "\u{E769}" } else { "\u{E768}" },
+                self.fonts.icons,
+                ACCENT,
+            );
+
+            round_fill(
+                hdc,
+                l.next,
+                if hot(self.hover, Hit::Next) { HOVER } else { PANEL },
+                (4.0 * s) as i32,
+            );
+            draw_glyph(hdc, l.next, "\u{E893}", self.fonts.icons, TEXT);
+
+            // Seek + volume.
             let dur = self.current_duration();
             draw_text(
                 hdc,
@@ -1291,11 +1449,7 @@ impl App {
                 DIM,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
-            let frac = if dur > 0.0 {
-                (self.pos / dur) as f32
-            } else {
-                0.0
-            };
+            let frac = if dur > 0.0 { (self.pos / dur) as f32 } else { 0.0 };
             draw_bar(
                 hdc,
                 l.seek,
@@ -1304,33 +1458,6 @@ impl App {
                 s,
             );
 
-            // transport
-            round_fill(
-                hdc,
-                l.prev,
-                if hot(self.hover, Hit::Prev) { HOVER } else { BG },
-                (4.0 * s) as i32,
-            );
-            draw_glyph(hdc, l.prev, "\u{E892}", self.fonts.icons, TEXT);
-
-            round_fill(hdc, l.play, COLORREF(0x0032_2418), (4.0 * s) as i32);
-            draw_glyph(
-                hdc,
-                l.play,
-                if self.playing { "\u{E769}" } else { "\u{E768}" },
-                self.fonts.icons,
-                ACCENT,
-            );
-
-            round_fill(
-                hdc,
-                l.next,
-                if hot(self.hover, Hit::Next) { HOVER } else { BG },
-                (4.0 * s) as i32,
-            );
-            draw_glyph(hdc, l.next, "\u{E893}", self.fonts.icons, TEXT);
-
-            // volume
             draw_glyph(hdc, l.vol_icon, "\u{E767}", self.fonts.icons, DIM);
             draw_bar(
                 hdc,
@@ -1348,15 +1475,7 @@ impl App {
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
 
-            round_fill(
-                hdc,
-                l.min_btn,
-                if hot(self.hover, Hit::Minimize) { HOVER } else { BG },
-                (4.0 * s) as i32,
-            );
-            draw_glyph(hdc, l.min_btn, "\u{E921}", self.fonts.icons, DIM);
-
-            // status line
+            // --- status line
             let status = if let Some(err) = &self.error {
                 (err.clone(), ERROR_RED)
             } else if self.scan.is_some() {
@@ -1382,7 +1501,7 @@ impl App {
             if self.scan.is_some() {
                 let bar = rect(
                     l.status.left,
-                    l.status.bottom - (2.0 * s) as i32,
+                    l.status.bottom - (2.0 * s).max(2.0) as i32,
                     l.status.right,
                     l.status.bottom,
                 );
@@ -1519,6 +1638,13 @@ impl Drop for App {
 
 // ---------------------------------------------------------------- helpers
 
+fn trim_working_set() {
+    // Ask Windows to page out what the scan/decoding touched; task manager then shows the real footprint.
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
 fn seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1631,6 +1757,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let app = Box::new(App::new(hwnd));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
                 SetTimer(Some(hwnd), TIMER_ID, 200, None);
+                trim_working_set();
                 LRESULT(0)
             }
             WM_DESTROY => {
@@ -1666,11 +1793,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     WM_SIZE => {
                         let l = app.layout();
-                        let w = (l.search.right - l.search.left).max(10);
-                        let h = (l.search.bottom - l.search.top).max(10);
-                        let _ = MoveWindow(app.edit, l.search.left, l.search.top, w, h, true);
+                        let edit = l.edit_rect(app.scale());
+                        let w = (edit.right - edit.left).max(10);
+                        let h = (edit.bottom - edit.top).max(10);
+                        let _ = MoveWindow(app.edit, edit.left, edit.top, w, h, true);
+                        // Vertically centre the single-line edit text.
+                        let mut fmt = rect(0, ((24.0 - 14.0) * app.scale() / 2.0) as i32, w, h);
+                        SendMessageW(
+                            app.edit,
+                            EM_SETRECT,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(&mut fmt as *mut RECT as isize)),
+                        );
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         LRESULT(0)
+                    }
+                    WM_NCCALCSIZE => {
+                        // Client area covers the whole window; we draw our own title bar.
+                        if wp.0 != 0 && IsZoomed(hwnd).as_bool() {
+                            let params = &mut *(lp.0 as *mut NCCALCSIZE_PARAMS);
+                            let dpi = GetDpiForWindow(hwnd);
+                            let bx = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi)
+                                + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                            let by = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi)
+                                + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                            params.rgrc[0].left += bx;
+                            params.rgrc[0].right -= bx;
+                            params.rgrc[0].top += by;
+                            params.rgrc[0].bottom -= by;
+                        }
+                        LRESULT(0)
+                    }
+                    WM_NCHITTEST => {
+                        let mut pt = POINT {
+                            x: (lp.0 & 0xffff) as i16 as i32,
+                            y: ((lp.0 >> 16) & 0xffff) as i16 as i32,
+                        };
+                        let _ = ScreenToClient(hwnd, &mut pt);
+                        LRESULT(app.nchit(pt.x, pt.y) as isize)
                     }
                     WM_MOUSEMOVE => {
                         let x = (lp.0 & 0xffff) as i16 as i32;
@@ -1716,7 +1876,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         if HWND(lp.0 as *mut c_void) == app.edit {
                             let hdc = HDC(wp.0 as *mut c_void);
                             SetTextColor(hdc, TEXT);
-                            SetBkColor(hdc, PANEL);
+                            SetBkColor(hdc, BG);
                             return LRESULT(app.brush_input.0 as isize);
                         }
                         DefWindowProcW(hwnd, msg, wp, lp)
@@ -1742,8 +1902,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WM_GETMINMAXINFO => {
                         if lp.0 != 0 {
                             let info = &mut *(lp.0 as *mut MINMAXINFO);
-                            info.ptMinTrackSize.x = (320.0 * app.scale()) as i32;
-                            info.ptMinTrackSize.y = (400.0 * app.scale()) as i32;
+                            info.ptMinTrackSize.x = (400.0 * app.scale()) as i32;
+                            info.ptMinTrackSize.y = (320.0 * app.scale()) as i32;
                         }
                         LRESULT(0)
                     }
@@ -1751,7 +1911,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let h = app.hover;
                         if matches!(
                             h,
-                            Some(Hit::Open | Hit::Shuffle | Hit::Prev | Hit::Play | Hit::Next | Hit::Minimize)
+                            Some(
+                                Hit::Open
+                                    | Hit::Shuffle
+                                    | Hit::Prev
+                                    | Hit::Play
+                                    | Hit::Next
+                                    | Hit::Min
+                                    | Hit::Max
+                                    | Hit::Close
+                            )
                         ) {
                             if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
                                 SetCursor(Some(cursor));
@@ -1790,19 +1959,40 @@ fn main() -> windows::core::Result<()> {
             WINDOW_EX_STYLE(0),
             class_name,
             w_ptr("Just Music"),
-            WS_OVERLAPPEDWINDOW,
+            WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            380,
-            560,
+            420,
+            610,
             None,
             None,
             Some(HINSTANCE(instance.0)),
             None,
         )?;
 
+        // Popup windows ignore CW_USEDEFAULT; centre inside the work area instead.
+        let mut work = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut RECT as *mut c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            work.left + (work.right - work.left - 420) / 2,
+            work.top + (work.bottom - work.top - 610) / 2,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
+        // Keep keyboard focus on the window, not the search box.
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1838,6 +2028,16 @@ mod tests {
             }
         }
         assert_eq!(shuffled_next(1, 0, 99), 0);
+    }
+
+    #[test]
+    fn bars_only_respond_near_the_line() {
+        let bar = rect(10, 50, 110, 68); // 18px row, 4-6px visible bar
+        assert!(bar_hit(bar, 50, 59, 1.0));
+        assert!(bar_hit(bar, 50, 56, 1.0));
+        assert!(!bar_hit(bar, 50, 65, 1.0));
+        assert!(!bar_hit(bar, 50, 51, 1.0));
+        assert!(!bar_hit(bar, 130, 59, 1.0));
     }
 
     #[test]
