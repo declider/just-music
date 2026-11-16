@@ -10,6 +10,7 @@ mod player;
 use std::{
     collections::VecDeque,
     ffi::c_void,
+    os::windows::ffi::OsStrExt,
     path::PathBuf,
     ptr::null_mut,
     sync::{
@@ -27,16 +28,16 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM},
         Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, CLEARTYPE_QUALITY,
-            CLIP_DEFAULT_PRECIS, CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC,
-            CreateDIBSection, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH,
-            DIB_RGB_COLORS, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-            DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW, Ellipse,
-            EndPaint, FillRect, GetStockObject, GetTextExtentPoint32W, HALFTONE, HBRUSH, HBITMAP,
-            HDC, HFONT, HGDIOBJ, IntersectClipRect, InvalidateRect, NULL_PEN, OUT_TT_PRECIS,
-            PAINTSTRUCT, RestoreDC, RoundRect, SRCCOPY, SaveDC, ScreenToClient, SelectObject,
-            SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
-            TRANSPARENT, UpdateWindow,
+            AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
+            BLENDFUNCTION, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+            CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+            CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
+            DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+            DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
+            GetTextExtentPoint32W, HALFTONE, HBRUSH, HBITMAP, HDC, HFONT, HGDIOBJ, IntersectClipRect,
+            InvalidateRect, NULL_PEN, OUT_TT_PRECIS, PAINTSTRUCT, RestoreDC, RoundRect, SRCCOPY,
+            SaveDC, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetBrushOrgEx,
+            SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, UpdateWindow,
         },
         System::{
             LibraryLoader::GetModuleHandleW,
@@ -71,6 +72,7 @@ const ACCENT: COLORREF = COLORREF(0x00ff_a05a); // #5aa0ff  (BGR)
 const HOVER: COLORREF = COLORREF(0x0030_2a26); // #262a30
 const SEL: COLORREF = COLORREF(0x004a_3226); // #26324a
 const TRACK_BG: COLORREF = COLORREF(0x0044_3a3a); // #3a3a44
+const PLACEHOLDER: COLORREF = COLORREF(0x0080_7a78); // #787a80
 
 const ERROR_RED: COLORREF = COLORREF(0x0068_7cff);
 const WM_TRAY: u32 = WM_APP + 1;
@@ -91,10 +93,10 @@ const EM_SETCUEBANNER: u32 = 0x1501;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const EM_SETRECT: u32 = 0x00B3;
 const EN_CHANGE_CODE: u32 = 0x0300;
+const EN_KILLFOCUS_CODE: u32 = 0x0200;
 
 struct Fonts {
     ui: HFONT,
-    bold: HFONT,
     small: HFONT,
     icons: HFONT,
 }
@@ -123,7 +125,6 @@ impl Fonts {
         };
         Self {
             ui: make(14, 400, w_ptr("Segoe UI")),
-            bold: make(14, 600, w_ptr("Segoe UI")),
             small: make(11, 400, w_ptr("Segoe UI")),
             icons: make(18, 400, w_ptr("Segoe MDL2 Assets")),
         }
@@ -169,6 +170,22 @@ unsafe fn draw_glyph(hdc: HDC, r: RECT, glyph: &str, font: HFONT, color: COLORRE
     draw_text(hdc, r, glyph, font, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+unsafe fn text_width(hdc: HDC, font: HFONT, text: &str) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
+    let buf: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    let old = SelectObject(hdc, HGDIOBJ(font.0));
+    let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+    SelectObject(hdc, old);
+    size.cx
+}
+
+fn overlaps(a: RECT, b: RECT) -> bool {
+    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
+}
+
 /// Folder silhouette for the "open folder" button (no MDL2 glyph needed).
 unsafe fn draw_folder(hdc: HDC, r: RECT, hot: bool, s: f32) {
     let color = if hot { TEXT } else { DIM };
@@ -180,36 +197,96 @@ unsafe fn draw_folder(hdc: HDC, r: RECT, hot: bool, s: f32) {
     round_fill(hdc, rect(left, top + (3.0 * s) as i32, left + w, top + h), color, (2.0 * s) as i32);
 }
 
-unsafe fn draw_bar(hdc: HDC, r: RECT, frac: f32, hot: bool, scale: f32) {
-    let center = (r.top + r.bottom) / 2;
-    let h = ((if hot { 5.0 } else { 3.0 }) * scale).round() as i32;
-    let track = RECT {
-        left: r.left,
-        top: center - h / 2,
-        right: r.right,
-        bottom: center - h / 2 + h,
-    };
-    round_fill(hdc, track, TRACK_BG, (h / 2).max(1));
+/// Antialiased white disc for slider knobs; GDI's `Ellipse` is visibly jagged at this size.
+struct Disc {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    size: i32,
+}
 
-    let frac = frac.clamp(0.0, 1.0);
-    let knob = ((if hot { 5.0 } else { 4.0 }) * scale).round() as i32;
-    let cx = (r.left + ((r.right - r.left) as f32 * frac) as i32)
-        .clamp(r.left + knob, (r.right - knob).max(r.left + knob));
-    if cx > r.left {
-        let done = RECT {
-            right: cx,
-            ..track
-        };
-        round_fill(hdc, done, ACCENT, (h / 2).max(1));
+impl Disc {
+    unsafe fn new(size: i32) -> Self {
+        let size = size.max(5);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = size;
+        bmi.bmiHeader.biHeight = -size;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut bits: *mut c_void = null_mut();
+        let bmp = unsafe { CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) }
+            .unwrap_or_default();
+        if !bmp.0.is_null() && !bits.is_null() {
+            // 4x4 supersampled coverage, premultiplied white.
+            let radius = size as f32 / 2.0 - 0.5;
+            let px = bits as *mut u8;
+            for y in 0..size {
+                for x in 0..size {
+                    let mut hits = 0u32;
+                    for sy in 0..4 {
+                        for sx in 0..4 {
+                            let fx = x as f32 + (sx as f32 + 0.5) / 4.0 - size as f32 / 2.0;
+                            let fy = y as f32 + (sy as f32 + 0.5) / 4.0 - size as f32 / 2.0;
+                            if fx * fx + fy * fy <= radius * radius {
+                                hits += 1;
+                            }
+                        }
+                    }
+                    let alpha = (hits * 255 / 16) as u8;
+                    let i = ((y * size + x) * 4) as usize;
+                    unsafe {
+                        *px.add(i) = alpha;
+                        *px.add(i + 1) = alpha;
+                        *px.add(i + 2) = alpha;
+                        *px.add(i + 3) = alpha;
+                    }
+                }
+            }
+        }
+
+        let dc = unsafe { CreateCompatibleDC(None) };
+        let old = unsafe { SelectObject(dc, HGDIOBJ(bmp.0)) };
+        Self { dc, bmp, old, size }
     }
 
-    let brush = CreateSolidBrush(TEXT);
-    let old_brush = SelectObject(hdc, HGDIOBJ(brush.0));
-    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = Ellipse(hdc, cx - knob, center - knob, cx + knob, center + knob);
-    SelectObject(hdc, old_brush);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(HGDIOBJ(brush.0));
+    unsafe fn draw(&self, hdc: HDC, x: i32, y: i32) {
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        let _ = unsafe {
+            AlphaBlend(
+                hdc,
+                x,
+                y,
+                self.size,
+                self.size,
+                self.dc,
+                0,
+                0,
+                self.size,
+                self.size,
+                blend,
+            )
+        };
+    }
+}
+
+impl Drop for Disc {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.dc.0.is_null() {
+                SelectObject(self.dc, self.old);
+                let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+                let _ = DeleteDC(self.dc);
+            }
+        }
+    }
 }
 
 /// Draws text clipped to `r`; long strings scroll with a pause at both ends.
@@ -217,13 +294,9 @@ unsafe fn draw_marquee(hdc: HDC, r: RECT, text: &str, font: HFONT, color: COLORR
     if text.is_empty() {
         return;
     }
-    let buf: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE::default();
-    let old = SelectObject(hdc, HGDIOBJ(font.0));
-    let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
-    SelectObject(hdc, old);
+    let width = text_width(hdc, font, text);
     let avail = (r.right - r.left).max(1);
-    if size.cx <= avail {
+    if width <= avail {
         draw_text(
             hdc,
             r,
@@ -237,7 +310,7 @@ unsafe fn draw_marquee(hdc: HDC, r: RECT, text: &str, font: HFONT, color: COLORR
 
     // 6px per 200ms tick, ~1.2s pause before and after.
     let gap = (24.0 * scale) as i32;
-    let travel = size.cx - avail + gap;
+    let travel = width - avail + gap;
     let scroll_ticks = (travel as f32 / (6.0 * scale)).ceil() as u32;
     let pause = 6;
     let t = tick % (pause + scroll_ticks + pause);
@@ -251,7 +324,7 @@ unsafe fn draw_marquee(hdc: HDC, r: RECT, text: &str, font: HFONT, color: COLORR
 
     let saved = SaveDC(hdc);
     IntersectClipRect(hdc, r.left, r.top, r.right, r.bottom);
-    let shifted = rect(r.left - offset, r.top, r.left - offset + size.cx + gap, r.bottom);
+    let shifted = rect(r.left - offset, r.top, r.left - offset + width + gap, r.bottom);
     draw_text(
         hdc,
         shifted,
@@ -287,7 +360,6 @@ struct Layout {
     tot_time: RECT,
     vol_bar: RECT,
     vol_pct: RECT,
-    status: RECT,
     row_h: i32,
     scrollbar: i32,
 }
@@ -304,9 +376,9 @@ fn rect(l: i32, t: i32, r: i32, b: i32) -> RECT {
 impl Layout {
     fn edit_rect(&self, s: f32) -> RECT {
         rect(
-            self.search.left + (22.0 * s) as i32,
+            self.search.left + (8.0 * s) as i32,
             self.search.top,
-            self.search.right - (6.0 * s) as i32,
+            self.search.right - (8.0 * s) as i32,
             self.search.bottom,
         )
     }
@@ -318,7 +390,6 @@ impl Layout {
         let open = s(24.0);
         let cap_w = s(34.0);
         let search_h = s(24.0);
-        let status_h = s(15.0);
         let bar_h = s(80.0);
         let cover_sz = s(68.0);
         let ctrl = s(28.0);
@@ -337,8 +408,8 @@ impl Layout {
             (header_h + search_h) / 2,
         );
 
-        let bar_top = (h - status_h - bar_h).max(header_h + row_h);
-        let bar = rect(0, bar_top, w, bar_top + bar_h);
+        let bar_top = (h - bar_h).max(header_h + row_h);
+        let bar = rect(0, bar_top, w, h);
         let list = rect(pad, header_h + s(4.0), w - pad, bar_top);
 
         let cover = rect(
@@ -370,15 +441,16 @@ impl Layout {
         );
 
         // Seek / volume row, aligned with the bottom of the cover.
+        // Small gaps inside the timeline, a wider gap before the volume group.
         let seek_y = bar_top + s(56.0);
         let vol_pct = rect(content_right - s(34.0), seek_y, content_right, seek_y + seek_h);
-        let vol_bar = rect(vol_pct.left - s(6.0) - s(64.0), seek_y, vol_pct.left - s(6.0), seek_y + seek_h);
-        let cur_time = rect(content_left, seek_y, content_left + s(34.0), seek_y + seek_h);
-        let tot_time = rect(vol_bar.left - s(6.0) - s(34.0), seek_y, vol_bar.left - s(6.0), seek_y + seek_h);
+        let vol_bar = rect(vol_pct.left - s(4.0) - s(64.0), seek_y, vol_pct.left - s(4.0), seek_y + seek_h);
+        let cur_time = rect(content_left, seek_y, content_left + s(36.0), seek_y + seek_h);
+        let tot_time = rect(vol_bar.left - s(12.0) - s(36.0), seek_y, vol_bar.left - s(12.0), seek_y + seek_h);
         let seek = rect(
-            cur_time.right + s(6.0),
+            cur_time.right + s(4.0),
             seek_y,
-            (tot_time.left - s(6.0)).max(cur_time.right + s(20.0)),
+            (tot_time.left - s(4.0)).max(cur_time.right + s(20.0)),
             seek_y + seek_h,
         );
 
@@ -403,7 +475,6 @@ impl Layout {
             tot_time,
             vol_bar,
             vol_pct,
-            status: rect(pad, h - status_h, w - pad, h - s(2.0)),
             row_h,
             scrollbar: s(8.0),
         }
@@ -440,6 +511,7 @@ enum Hit {
     Seek,
     Volume,
     Scroll,
+    Search,
     Row(usize),
 }
 
@@ -489,12 +561,13 @@ struct App {
     hover: Option<Hit>,
     scan: Option<Scan>,
     scan_count: usize,
-    anim: u32,
     marquee: u32,
 
     cover: Option<Cover>,
     rng: u64,
     dpi_scale: f32,
+    knob: Disc,
+    knob_hot: Disc,
 
     buf_dc: HDC,
     buf_bmp: HBITMAP,
@@ -534,11 +607,12 @@ impl App {
             hover: None,
             scan: None,
             scan_count: 0,
-            anim: 0,
             marquee: 0,
             cover: None,
             rng: seed(),
             dpi_scale: dpi,
+            knob: unsafe { Disc::new((9.0 * dpi).round() as i32) },
+            knob_hot: unsafe { Disc::new((11.0 * dpi).round() as i32) },
             buf_dc: HDC::default(),
             buf_bmp: HBITMAP::default(),
             buf_old: HGDIOBJ::default(),
@@ -553,7 +627,7 @@ impl App {
         }
 
         unsafe {
-            app.icon = make_icon();
+            app.icon = load_icon_file().unwrap_or_else(|| make_icon());
             if !app.icon.is_invalid() {
                 SendMessageW(
                     hwnd,
@@ -617,6 +691,8 @@ impl App {
                 Some(LPARAM(w_ptr("Search title or artist").0 as isize)),
             );
             SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(256)), Some(LPARAM(0)));
+            // Empty and unfocused: the window paints the faded placeholder instead.
+            let _ = ShowWindow(edit, SW_HIDE);
         }
     }
 
@@ -667,6 +743,23 @@ impl App {
     fn invalidate(&self) {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// Faded hint shown inside the empty search box (also the only status line now).
+    fn placeholder(&self) -> (String, COLORREF) {
+        if let Some(err) = &self.error {
+            (err.clone(), ERROR_RED)
+        } else if self.scan.is_some() {
+            (format!("Scanning… {} files", self.scan_count), PLACEHOLDER)
+        } else if self.tracks.is_empty() {
+            ("Open a folder to start".to_string(), PLACEHOLDER)
+        } else {
+            let mut text = format!("{} tracks", self.tracks.len());
+            if !self.queue.is_empty() {
+                text.push_str(&format!(" · queue {}", self.queue.len()));
+            }
+            (text, PLACEHOLDER)
         }
     }
 
@@ -939,7 +1032,6 @@ impl App {
     }
 
     fn tick(&mut self) {
-        self.anim = self.anim.wrapping_add(1);
         self.marquee = self.marquee.wrapping_add(1);
         self.poll_scan();
 
@@ -964,12 +1056,6 @@ impl App {
             self.tray_tip = tip;
             unsafe {
                 self.update_tray_tip();
-            }
-        }
-
-        unsafe {
-            if IsWindowVisible(self.hwnd).as_bool() && !IsIconic(self.hwnd).as_bool() {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
             }
         }
     }
@@ -1045,6 +1131,9 @@ impl App {
         }
         if inside(l.open, x, y) {
             return Some(Hit::Open);
+        }
+        if inside(l.search, x, y) {
+            return Some(Hit::Search);
         }
         if inside(l.shuffle, x, y) {
             return Some(Hit::Shuffle);
@@ -1134,12 +1223,21 @@ impl App {
     }
 
     fn on_mouse_down(&mut self, x: i32, y: i32) {
+        // Keep the search box from holding focus when clicking elsewhere.
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
         match self.hit_test(x, y) {
             Some(Hit::Open) => {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.load_folder(dir);
                 }
             }
+            Some(Hit::Search) => unsafe {
+                let _ = ShowWindow(self.edit, SW_SHOW);
+                let _ = SetFocus(Some(self.edit));
+                self.invalidate();
+            },
             Some(Hit::Shuffle) => {
                 self.shuffle = !self.shuffle;
                 self.save_settings();
@@ -1246,6 +1344,15 @@ impl App {
         self.invalidate();
     }
 
+    fn edit_focus_lost(&mut self) {
+        if self.search.is_empty() {
+            unsafe {
+                let _ = ShowWindow(self.edit, SW_HIDE);
+            }
+        }
+        self.invalidate();
+    }
+
     fn context_menu_row(&mut self, row: usize) {
         let Some(&idx) = self.visible.get(row) else {
             return;
@@ -1346,19 +1453,31 @@ impl App {
             return;
         }
 
-        self.ensure_buffer(hdc, rc.right, rc.bottom);
+        let fresh = self.ensure_buffer(hdc, rc.right, rc.bottom);
+        let dirty = if fresh { rc } else { ps.rcPaint };
 
         unsafe {
-            self.draw(self.buf_dc, rc);
-            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(self.buf_dc), 0, 0, SRCCOPY);
+            self.draw(self.buf_dc, dirty);
+            let _ = BitBlt(
+                hdc,
+                dirty.left,
+                dirty.top,
+                dirty.right - dirty.left,
+                dirty.bottom - dirty.top,
+                Some(self.buf_dc),
+                dirty.left,
+                dirty.top,
+                SRCCOPY,
+            );
             let _ = EndPaint(hwnd, &ps);
         }
     }
 
     /// Back buffer survives repaints; only a resize recreates it.
-    fn ensure_buffer(&mut self, hdc: HDC, w: i32, h: i32) {
+    /// Returns whether the bitmap was recreated (so callers must redraw everything).
+    fn ensure_buffer(&mut self, hdc: HDC, w: i32, h: i32) -> bool {
         if self.buf_w == w && self.buf_h == h && !self.buf_dc.0.is_null() {
-            return;
+            return false;
         }
         unsafe {
             if !self.buf_dc.0.is_null() {
@@ -1377,70 +1496,90 @@ impl App {
             self.buf_w = w;
             self.buf_h = h;
         }
+        true
     }
 
-    unsafe fn draw(&mut self, hdc: HDC, rc: RECT) {
+    unsafe fn draw(&mut self, hdc: HDC, dirty: RECT) {
         let l = self.layout();
         let s = self.scale();
         let hot = |h: Option<Hit>, want: Hit| h == Some(want);
 
         unsafe {
-            fill(hdc, rc, BG);
+            fill(hdc, dirty, BG);
 
             // --- title bar: open + search + window buttons
-            fill(hdc, l.header, PANEL);
+            if overlaps(dirty, l.header) {
+                fill(hdc, l.header, PANEL);
 
-            round_fill(
-                hdc,
-                l.open,
-                if hot(self.hover, Hit::Open) { HOVER } else { PANEL },
-                (4.0 * s) as i32,
-            );
-            draw_folder(hdc, l.open, hot(self.hover, Hit::Open), s);
+                round_fill(
+                    hdc,
+                    l.open,
+                    if hot(self.hover, Hit::Open) { HOVER } else { PANEL },
+                    (4.0 * s) as i32,
+                );
+                draw_folder(hdc, l.open, hot(self.hover, Hit::Open), s);
 
-            let focused = GetFocus() == self.edit;
-            fill(hdc, expand(l.search, (1.0 * s) as i32), if focused { ACCENT } else { TRACK_BG });
-            fill(hdc, l.search, BG);
-            draw_glyph(
-                hdc,
-                rect(l.search.left, l.search.top, l.search.left + (22.0 * s) as i32, l.search.bottom),
-                "\u{E721}",
-                self.fonts.icons,
-                DIM,
-            );
-
-            // Window buttons.
-            for (r, hovered) in [
-                (l.min_btn, hot(self.hover, Hit::Min)),
-                (l.max_btn, hot(self.hover, Hit::Max)),
-                (l.close_btn, hot(self.hover, Hit::Close)),
-            ] {
-                if hovered {
-                    fill(hdc, r, if r == l.close_btn { COLORREF(0x001c_2bc4) } else { HOVER });
+                let focused = GetFocus() == self.edit;
+                fill(hdc, expand(l.search, (1.0 * s) as i32), if focused { ACCENT } else { TRACK_BG });
+                fill(hdc, l.search, BG);
+                if self.search.is_empty() && !focused {
+                    let (text, color) = self.placeholder();
+                    draw_text(
+                        hdc,
+                        l.edit_rect(s),
+                        &text,
+                        self.fonts.small,
+                        color,
+                        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
                 }
-            }
-            draw_glyph(hdc, l.min_btn, "\u{E921}", self.fonts.icons, TEXT);
-            draw_glyph(
-                hdc,
-                l.max_btn,
-                if IsZoomed(self.hwnd).as_bool() { "\u{E923}" } else { "\u{E922}" },
-                self.fonts.icons,
-                TEXT,
-            );
-            draw_glyph(hdc, l.close_btn, "\u{E8BB}", self.fonts.icons, TEXT);
 
-            fill(
-                hdc,
-                rect(0, l.header.bottom - 1, rc.right, l.header.bottom),
-                COLORREF(0x0030_2a26),
-            );
+                // Window buttons.
+                for (r, hovered) in [
+                    (l.min_btn, hot(self.hover, Hit::Min)),
+                    (l.max_btn, hot(self.hover, Hit::Max)),
+                    (l.close_btn, hot(self.hover, Hit::Close)),
+                ] {
+                    if hovered {
+                        fill(hdc, r, if r == l.close_btn { COLORREF(0x001c_2bc4) } else { HOVER });
+                    }
+                }
+                // Minimize sits near the bottom of the caption, like a taskbar "_".
+                let mw = (10.0 * s).round() as i32;
+                let mcx = (l.min_btn.left + l.min_btn.right) / 2;
+                let my = l.min_btn.bottom - (11.0 * s).round() as i32;
+                fill(
+                    hdc,
+                    rect(mcx - mw / 2, my, mcx + mw / 2, my + (1.0 * s).round().max(1.0) as i32),
+                    TEXT,
+                );
+                draw_glyph(
+                    hdc,
+                    l.max_btn,
+                    if IsZoomed(self.hwnd).as_bool() { "\u{E923}" } else { "\u{E922}" },
+                    self.fonts.icons,
+                    TEXT,
+                );
+                draw_glyph(hdc, l.close_btn, "\u{E8BB}", self.fonts.icons, TEXT);
+
+                fill(
+                    hdc,
+                    rect(0, l.header.bottom - 1, l.header.right, l.header.bottom),
+                    COLORREF(0x0030_2a26),
+                );
+            }
 
             // --- playlist
-            self.draw_list(hdc, &l, s);
+            if overlaps(dirty, l.list) {
+                self.draw_list(hdc, &l, s);
+            }
 
             // --- player bar
+            if !overlaps(dirty, l.bar) {
+                return;
+            }
             fill(hdc, l.bar, PANEL);
-            fill(hdc, rect(0, l.bar.top, rc.right, l.bar.top + 1), COLORREF(0x0030_2a26));
+            fill(hdc, rect(0, l.bar.top, l.bar.right, l.bar.top + 1), COLORREF(0x0030_2a26));
 
             if let Some(cover) = &self.cover {
                 let mem = CreateCompatibleDC(Some(hdc));
@@ -1475,7 +1614,7 @@ impl App {
                 hdc,
                 l.title,
                 &title,
-                self.fonts.bold,
+                self.fonts.ui,
                 if self.current.is_some() { TEXT } else { DIM },
                 s,
                 self.marquee,
@@ -1543,7 +1682,7 @@ impl App {
                 &fmt_time(self.pos),
                 self.fonts.small,
                 DIM,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
             draw_text(
                 hdc,
@@ -1554,20 +1693,18 @@ impl App {
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
             let frac = if dur > 0.0 { (self.pos / dur) as f32 } else { 0.0 };
-            draw_bar(
+            self.draw_slider(
                 hdc,
                 l.seek,
                 frac,
                 hot(self.hover, Hit::Seek) || self.drag == Drag::Seek,
-                s,
             );
 
-            draw_bar(
+            self.draw_slider(
                 hdc,
                 l.vol_bar,
                 self.volume,
                 hot(self.hover, Hit::Volume) || self.drag == Drag::Volume,
-                s,
             );
             draw_text(
                 hdc,
@@ -1577,51 +1714,31 @@ impl App {
                 DIM,
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
-
-            // --- status line
-            let status = if let Some(err) = &self.error {
-                (err.clone(), ERROR_RED)
-            } else if self.scan.is_some() {
-                (format!("Scanning… {} files", self.scan_count), DIM)
-            } else if self.tracks.is_empty() {
-                ("Open a folder to start".to_string(), DIM)
-            } else {
-                let mut text = format!("{} tracks", self.tracks.len());
-                if !self.queue.is_empty() {
-                    text.push_str(&format!(" · queue {}", self.queue.len()));
-                }
-                (text, DIM)
-            };
-            draw_text(
-                hdc,
-                l.status,
-                &status.0,
-                self.fonts.small,
-                status.1,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-            );
-
-            if self.scan.is_some() {
-                let bar = rect(
-                    l.status.left,
-                    l.status.bottom - (2.0 * s).max(2.0) as i32,
-                    l.status.right,
-                    l.status.bottom,
-                );
-                fill(hdc, bar, PANEL);
-                let width = (bar.right - bar.left) as f32;
-                let seg = width * 0.3;
-                let phase = (self.anim % 60) as f32 / 60.0;
-                let x = bar.left + ((width + seg) * phase) as i32 - seg as i32;
-                let seg_rect = rect(
-                    x.max(bar.left),
-                    bar.top,
-                    (x + seg as i32).min(bar.right),
-                    bar.bottom,
-                );
-                fill(hdc, seg_rect, ACCENT);
-            }
         }
+    }
+
+    /// Thin rounded track with an antialiased disc knob.
+    unsafe fn draw_slider(&self, hdc: HDC, r: RECT, frac: f32, hot: bool) {
+        let s = self.scale();
+        let center = (r.top + r.bottom) / 2;
+        let th = ((if hot { 5.0 } else { 3.0 }) * s).round() as i32;
+        let track = rect(r.left, center - th / 2, r.right, center - th / 2 + th);
+        round_fill(hdc, track, TRACK_BG, (th / 2).max(1));
+
+        let disc = if hot { &self.knob_hot } else { &self.knob };
+        let rad = disc.size / 2;
+        let frac = frac.clamp(0.0, 1.0);
+        let cx = (r.left + ((r.right - r.left) as f32 * frac) as i32)
+            .clamp(r.left + rad, (r.right - rad).max(r.left + rad));
+        if cx > r.left {
+            round_fill(
+                hdc,
+                rect(track.left, track.top, cx, track.bottom),
+                ACCENT,
+                (th / 2).max(1),
+            );
+        }
+        disc.draw(hdc, cx - rad, center - rad);
     }
 
     unsafe fn draw_list(&self, hdc: HDC, l: &Layout, s: f32) {
@@ -1630,6 +1747,7 @@ impl App {
         let visible_rows = rows.min(total.saturating_sub(self.scroll));
 
         unsafe {
+            fill(hdc, l.list, BG);
             for i in 0..visible_rows {
                 let vi = self.scroll + i;
                 let idx = self.visible[vi];
@@ -1648,11 +1766,23 @@ impl App {
 
                 let track = &self.tracks[idx];
                 let left = row.left + (7.0 * s) as i32;
+                let right = row.right - (6.0 * s) as i32;
 
-                let artist_w = (((row.right - row.left) as f32) * 0.38)
-                    .min(150.0 * s)
-                    .max(60.0 * s) as i32;
-                let title_rc = rect(left, row.top, row.right - artist_w, row.bottom);
+                // Measure the artist so the title can use every pixel up to it.
+                let cap = ((row.right - row.left) as f32 * 0.45) as i32;
+                let measured = if track.artist.is_empty() {
+                    0
+                } else {
+                    text_width(hdc, self.fonts.small, &track.artist)
+                };
+                let artist_w = measured.min(cap);
+                let gap = if artist_w > 0 { (10.0 * s) as i32 } else { 0 };
+                let title_rc = rect(
+                    left,
+                    row.top,
+                    (right - artist_w - gap).max(left + (20.0 * s) as i32),
+                    row.bottom,
+                );
                 draw_text(
                     hdc,
                     title_rc,
@@ -1662,13 +1792,14 @@ impl App {
                     DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                 );
 
-                if !track.artist.is_empty() {
-                    let artist_rc = rect(
-                        row.right - artist_w,
-                        row.top,
-                        row.right - (6.0 * s) as i32,
-                        row.bottom,
-                    );
+                if artist_w > 0 {
+                    // Too long to fit: give GDI the whole row so it ellipsizes the
+                    // tail instead of clipping the start of the name.
+                    let artist_rc = if measured > cap {
+                        rect(left, row.top, right, row.bottom)
+                    } else {
+                        rect(right - artist_w - (4.0 * s) as i32, row.top, right, row.bottom)
+                    };
                     draw_text(
                         hdc,
                         artist_rc,
@@ -1705,7 +1836,12 @@ impl App {
                 let offset = ((self.scroll as f32 / max_scroll as f32)
                     * (height - thumb_h) as f32) as i32;
                 let thumb = rect(track.left, track.top + offset, track.right, track.top + offset + thumb_h);
-                round_fill(hdc, thumb, TRACK_BG, 3);
+                let thumb_color = if self.drag == Drag::Scroll || self.hover == Some(Hit::Scroll) {
+                    ACCENT
+                } else {
+                    TRACK_BG
+                };
+                round_fill(hdc, thumb, thumb_color, 3);
             }
         }
     }
@@ -1725,7 +1861,6 @@ impl Drop for App {
                 let _ = DeleteObject(HGDIOBJ(cover.bmp.0));
             }
             let _ = DeleteObject(HGDIOBJ(self.fonts.ui.0));
-            let _ = DeleteObject(HGDIOBJ(self.fonts.bold.0));
             let _ = DeleteObject(HGDIOBJ(self.fonts.small.0));
             let _ = DeleteObject(HGDIOBJ(self.fonts.icons.0));
             let _ = DeleteObject(HGDIOBJ(self.brush_input.0));
@@ -1785,6 +1920,28 @@ fn set_tip(dst: &mut [u16; 128], text: &str) {
     let wide: Vec<u16> = text.encode_utf16().take(126).collect();
     dst[..wide.len()].copy_from_slice(&wide);
     dst[wide.len()] = 0;
+}
+
+/// Optional `icon.ico` next to the exe, so users can swap the app icon without a rebuild.
+unsafe fn load_icon_file() -> Option<HICON> {
+    let exe = std::env::current_exe().ok()?;
+    let path = exe.parent()?.join("icon.ico");
+    if !path.is_file() {
+        return None;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        LoadImageW(
+            None,
+            PCWSTR(wide.as_ptr()),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+    }
+    .ok()?;
+    Some(HICON(handle.0))
 }
 
 unsafe fn make_icon() -> HICON {
@@ -1886,9 +2043,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     WM_ERASEBKGND => LRESULT(1),
                     WM_TIMER => {
                         app.tick();
-                        // Idle UI is static; only repaint while something is moving.
-                        if (app.playing || app.scan.is_some()) && IsWindowVisible(hwnd).as_bool() {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        // Repaint only what actually moves: the bar while playing,
+                        // and the search hint/list while a scan reports progress.
+                        if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+                            let l = app.layout();
+                            if app.scan.is_some() {
+                                let mut r = l.header;
+                                let _ = InvalidateRect(Some(hwnd), Some(&r), false);
+                                r = l.list;
+                                let _ = InvalidateRect(Some(hwnd), Some(&r), false);
+                            } else if app.playing {
+                                let r = l.bar;
+                                let _ = InvalidateRect(Some(hwnd), Some(&r), false);
+                            }
                         }
                         LRESULT(0)
                     }
@@ -1977,8 +2144,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     WM_COMMAND => {
                         let code = ((wp.0 >> 16) & 0xffff) as u32;
-                        if code == EN_CHANGE_CODE && HWND(lp.0 as *mut c_void) == app.edit {
-                            app.on_search_changed();
+                        let ctl = HWND(lp.0 as *mut c_void);
+                        if ctl == app.edit {
+                            if code == EN_CHANGE_CODE {
+                                app.on_search_changed();
+                            } else if code == EN_KILLFOCUS_CODE {
+                                app.edit_focus_lost();
+                            }
                         }
                         LRESULT(0)
                     }

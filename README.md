@@ -6,9 +6,9 @@ A tiny music player for Windows. Load a folder, hit play. Nothing else.
 
 - Folder as playlist (recursive scan, on a worker thread), title + artist from tags, cover of the current track
 - FLAC, MP3, WAV, OGG/Vorbis, M4A/AAC
-- Search by title or artist in the title bar
+- Search by title or artist in the title bar; the empty box shows track count, scan progress or errors as a faded hint
 - Shuffle, "play next" / "add to queue" via right-click
-- Volume and seek sliders (volume shows its %)
+- Volume and seek sliders (volume shows its %); the scrollbar thumb highlights while dragged
 - Borderless window with custom title bar: folder, search, minimise / maximise / close
 - Player bar: cover, title/artist, transport + shuffle, seek, volume
 - Tray icon: play/pause, previous, next, show, hide, exit
@@ -23,6 +23,13 @@ cargo build --release
 Output: `target/release/just_music.exe` (~2.3 MB). Native Win32/GDI UI, no runtime.
 
 Run `just_music.exe <folder>` to open a folder at startup (otherwise use the folder button).
+
+### App icon
+
+Drop an `icon.ico` next to `just_music.exe` and it is used for the window, taskbar and
+tray (restart the app after replacing it). Without it, a built-in 32×32 icon is drawn.
+Explorer's file icon is taken from the executable's embedded resources, so changing that
+one needs an icon resource in the build, not just the file.
 
 ## Settings
 
