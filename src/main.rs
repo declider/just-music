@@ -1244,6 +1244,30 @@ impl App {
             self.hover = hit;
             self.invalidate();
         }
+        self.update_cursor(hit);
+    }
+
+    /// Keeps the pointer in sync with the hovered control, independent of WM_SETCURSOR timing.
+    fn update_cursor(&self, hit: Option<Hit>) {
+        let clickable = matches!(
+            hit,
+            Some(
+                Hit::Open
+                    | Hit::Shuffle
+                    | Hit::Prev
+                    | Hit::Play
+                    | Hit::Next
+                    | Hit::Min
+                    | Hit::Max
+                    | Hit::Close
+            )
+        );
+        unsafe {
+            let id = if clickable { IDC_HAND } else { IDC_ARROW };
+            if let Ok(cursor) = LoadCursorW(None, id) {
+                SetCursor(Some(cursor));
+            }
+        }
     }
 
     fn on_mouse_down(&mut self, x: i32, y: i32) {
@@ -2219,27 +2243,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         LRESULT(0)
                     }
                     WM_SETCURSOR => {
-                        let h = app.hover;
-                        if matches!(
-                            h,
-                            Some(
-                                Hit::Open
-                                    | Hit::Shuffle
-                                    | Hit::Prev
-                                    | Hit::Play
-                                    | Hit::Next
-                                    | Hit::Min
-                                    | Hit::Max
-                                    | Hit::Close
-                            )
-                        ) {
-                            if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
-                                SetCursor(Some(cursor));
-                            }
+                        // Use the live cursor position: `hover` may not match the
+                        // control the pointer just left.
+                        if (lp.0 & 0xffff) as u32 == HTCLIENT {
+                            let mut pt = POINT::default();
+                            let _ = GetCursorPos(&mut pt);
+                            let _ = ScreenToClient(hwnd, &mut pt);
+                            app.update_cursor(app.hit_test(pt.x, pt.y));
                             return LRESULT(1);
                         }
                         DefWindowProcW(hwnd, msg, wp, lp)
                     }
+                    // Borderless: never let the default paint a frame on activation.
+                    WM_NCACTIVATE => LRESULT(1),
+                    WM_NCPAINT => LRESULT(0),
                     _ => DefWindowProcW(hwnd, msg, wp, lp),
                 }
             }
