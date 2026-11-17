@@ -1,18 +1,25 @@
 # Just Music
 
-A tiny music player for Windows. Load a folder, hit play. Nothing else.
+A tiny music player for Windows. Pick a folder, hit play. Nothing else.
+
+**English** · [Русский](README.ru.md)
 
 ## Features
 
-- Folder as playlist (recursive scan, on a worker thread), title + artist from tags, cover of the current track
+- Folder as playlist (recursive scan on a worker thread), title + artist from tags, cover of the current track
 - FLAC, MP3, WAV, OGG/Vorbis, M4A/AAC
 - Search by title or artist in the title bar; the empty box shows track count, scan progress or errors as a faded hint
 - Shuffle, "play next" / "add to queue" via right-click
 - Volume and seek sliders (volume shows its %); the scrollbar thumb highlights while dragged
-- Borderless window with custom title bar: folder, search, minimise / maximise / close
+- Borderless window with a custom title bar: folder, search, minimise / maximise / close
 - Player bar: cover, title/artist, transport + shuffle, seek, volume
 - Tray icon: play/pause, previous, next, show, hide, exit
 - Dark theme, compact layout
+- Native Win32/GDI, no runtime, no telemetry
+
+## Download
+
+Grab `just_music.exe` from the [latest release](../../releases/latest) and run it. No installer, no runtime.
 
 ## Build
 
@@ -20,7 +27,7 @@ A tiny music player for Windows. Load a folder, hit play. Nothing else.
 cargo build --release
 ```
 
-Output: `target/release/just_music.exe` (~2.3 MB). Native Win32/GDI UI, no runtime.
+Output: `target/release/just_music.exe` (~2.3 MB).
 
 Run `just_music.exe <folder>` to open a folder at startup (otherwise use the folder button).
 
@@ -53,3 +60,7 @@ Playback is rodio → WASAPI shared mode. No EQ, no filters, no normalisation, n
 crossfade: decoded samples go straight to the output (volume slider is a plain
 gain multiply, 1.0 = untouched). Windows' shared mixer still resamples to the
 device mix format, as it does for every app that isn't in exclusive mode.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
