@@ -8,10 +8,9 @@ mod library;
 mod player;
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ffi::c_void,
-    os::windows::ffi::OsStrExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::null_mut,
     sync::{
         Arc,
@@ -30,7 +29,7 @@ use windows::{
         Graphics::Gdi::{
             AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
             BLENDFUNCTION, BeginPaint, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-            CreateBitmap, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+            CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
             CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DRAW_TEXT_FORMAT,
             DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
             DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetStockObject,
@@ -547,6 +546,7 @@ struct App {
     hwnd: HWND,
     edit: HWND,
     icon: HICON,
+    icon_small: HICON,
     fonts: Fonts,
     brush_input: HBRUSH,
 
@@ -602,6 +602,7 @@ impl App {
             hwnd,
             edit: HWND::default(),
             icon: HICON::default(),
+            icon_small: HICON::default(),
             fonts: unsafe { Fonts::new((96.0 * dpi) as i32) },
             brush_input: unsafe { CreateSolidBrush(BG) },
             audio: Audio::open().ok(),
@@ -644,19 +645,23 @@ impl App {
         }
 
         unsafe {
-            app.icon = load_icon_file().unwrap_or_else(|| make_icon());
+            let dpi_px = (96.0 * dpi) as u32;
+            app.icon = load_app_icon(dpi_px, false);
+            app.icon_small = load_app_icon(dpi_px, true);
             if !app.icon.is_invalid() {
-                SendMessageW(
-                    hwnd,
-                    WM_SETICON,
-                    Some(WPARAM(ICON_SMALL as usize)),
-                    Some(LPARAM(app.icon.0 as isize)),
-                );
                 SendMessageW(
                     hwnd,
                     WM_SETICON,
                     Some(WPARAM(ICON_BIG as usize)),
                     Some(LPARAM(app.icon.0 as isize)),
+                );
+            }
+            if !app.icon_small.is_invalid() {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(app.icon_small.0 as isize)),
                 );
             }
             app.create_edit(hwnd);
@@ -720,7 +725,11 @@ impl App {
         nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY;
-        nid.hIcon = self.icon;
+        nid.hIcon = if self.icon_small.is_invalid() {
+            self.icon
+        } else {
+            self.icon_small
+        };
         set_tip(&mut nid.szTip, "Just Music");
         unsafe {
             if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
@@ -774,7 +783,7 @@ impl App {
     fn placeholder(&self) -> (String, COLORREF) {
         if let Some(err) = &self.error {
             (err.clone(), ERROR_RED)
-        } else if self.scan.is_some() {
+        } else if self.tracks.is_empty() && self.scan.is_some() {
             (format!("Scanning… {} files", self.scan_count), PLACEHOLDER)
         } else if self.tracks.is_empty() {
             ("Open a folder to start".to_string(), PLACEHOLDER)
@@ -811,12 +820,23 @@ impl App {
             audio.stop();
         }
 
+        // Earlier results for this folder: instant list, and the rescan below
+        // only re-reads files that changed on disk.
+        self.tracks = library::load_cache(&dir);
+        self.refilter();
+        let mut reuse: HashMap<PathBuf, Track> = self
+            .tracks
+            .iter()
+            .cloned()
+            .map(|t| (t.path.clone(), t))
+            .collect();
+
         let (tx, rx) = mpsc::channel();
         let count = Arc::new(AtomicUsize::new(0));
         let thread_count = count.clone();
         std::thread::spawn(move || {
             let mut tracks = Vec::new();
-            library::scan(&dir, &mut tracks, &thread_count);
+            library::scan(&dir, &mut tracks, &mut reuse, &thread_count);
             tracks.sort_by(|a, b| {
                 a.title
                     .to_lowercase()
@@ -826,7 +846,7 @@ impl App {
             let _ = tx.send(tracks);
         });
         self.scan = Some(Scan { rx, count });
-        self.scan_count = 0;
+        self.scan_count = self.tracks.len();
         self.save_settings();
         self.invalidate();
     }
@@ -837,10 +857,16 @@ impl App {
         };
         match scan.rx.try_recv() {
             Ok(tracks) => {
-                self.tracks = tracks;
                 self.scan = None;
+                let unchanged = tracks.len() == self.tracks.len()
+                    && tracks
+                        .iter()
+                        .zip(self.tracks.iter())
+                        .all(|(a, b)| a.path == b.path && a.stamp == b.stamp);
+                if !unchanged {
+                    self.apply_rescan(tracks);
+                }
                 self.scan_count = self.tracks.len();
-                self.refilter();
                 self.invalidate();
                 trim_working_set();
             }
@@ -851,6 +877,31 @@ impl App {
                 self.scan = None;
             }
         }
+    }
+
+    /// Swaps in a fresh scan, keeping playback and the queue pointed at the
+    /// same files even when indices moved.
+    fn apply_rescan(&mut self, tracks: Vec<Track>) {
+        let (current, queue) =
+            remap_after_scan(&self.tracks, &tracks, self.current, &self.queue);
+        let lost_current = self.current.is_some() && current.is_none();
+        self.tracks = tracks;
+        self.current = current;
+        self.queue = queue.into_iter().collect();
+        if lost_current {
+            // The playing file disappeared: stop instead of pointing at a stranger.
+            if let Some(audio) = &self.audio {
+                audio.stop();
+            }
+            self.playing = false;
+            self.pos = 0.0;
+        }
+
+        self.refilter();
+        if let Some(folder) = self.folder.clone() {
+            library::save_cache(&folder, &self.tracks);
+        }
+        self.invalidate();
     }
 
     fn refilter(&mut self) {
@@ -1864,7 +1915,7 @@ impl App {
             }
 
             if total == 0 {
-                let text = if self.scan.is_some() {
+                let text = if self.tracks.is_empty() && self.scan.is_some() {
                     format!("Scanning… {} files", self.scan_count)
                 } else {
                     "No matches".to_string()
@@ -1919,6 +1970,9 @@ impl Drop for App {
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
             }
+            if !self.icon_small.is_invalid() {
+                let _ = DestroyIcon(self.icon_small);
+            }
         }
     }
 }
@@ -1968,93 +2022,63 @@ fn shuffled_next(len: usize, current: usize, rand: u64) -> usize {
     n
 }
 
+/// Translates current/queue indices from an old track list to a freshly
+/// scanned one by file path, dropping entries whose files disappeared.
+fn remap_after_scan(
+    old: &[Track],
+    new: &[Track],
+    current: Option<usize>,
+    queue: &VecDeque<usize>,
+) -> (Option<usize>, VecDeque<usize>) {
+    let index: HashMap<&Path, usize> = new
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.path.as_path(), i))
+        .collect();
+    let translated = |i: &usize| {
+        old.get(*i)
+            .and_then(|t| index.get(t.path.as_path()).copied())
+    };
+    (current.and_then(|i| translated(&i)), queue.iter().filter_map(translated).collect())
+}
+
 fn set_tip(dst: &mut [u16; 128], text: &str) {
     let wide: Vec<u16> = text.encode_utf16().take(126).collect();
     dst[..wide.len()].copy_from_slice(&wide);
     dst[wide.len()] = 0;
 }
 
-/// Optional `icon.ico` next to the exe, so users can swap the app icon without a rebuild.
-unsafe fn load_icon_file() -> Option<HICON> {
-    let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.join("icon.ico");
-    if !path.is_file() {
-        return None;
-    }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let handle = unsafe {
-        LoadImageW(
-            None,
-            PCWSTR(wide.as_ptr()),
-            IMAGE_ICON,
-            0,
-            0,
-            LR_LOADFROMFILE | LR_DEFAULTSIZE,
-        )
-    }
-    .ok()?;
-    Some(HICON(handle.0))
-}
-
-unsafe fn make_icon() -> HICON {
-    let (rgba, w, h) = icon_rgba();
-    unsafe {
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = w as i32;
-        bmi.bmiHeader.biHeight = -(h as i32);
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB.0;
-
-        let mut bits: *mut c_void = null_mut();
-        let Ok(color) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
-            return HICON::default();
-        };
-        std::ptr::copy_nonoverlapping(rgba.as_ptr(), bits as *mut u8, rgba.len());
-
-        let mask = CreateBitmap(w as i32, h as i32, 1, 1, None);
-        let info = ICONINFO {
-            fIcon: windows::core::BOOL::from(true),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let icon = CreateIconIndirect(&info).unwrap_or_default();
-        let _ = DeleteObject(HGDIOBJ(color.0));
-        let _ = DeleteObject(HGDIOBJ(mask.0));
-        icon
-    }
-}
-
-/// 32x32 rounded dark tile with a play triangle.
-fn icon_rgba() -> (Vec<u8>, u32, u32) {
-    const S: u32 = 32;
-    let mut rgba = vec![0u8; (S * S * 4) as usize];
-    for y in 0..S {
-        for x in 0..S {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let r = 8.0;
-            let in_x = px.clamp(r, S as f32 - r);
-            let in_y = py.clamp(r, S as f32 - r);
-            let d = ((px - in_x).powi(2) + (py - in_y).powi(2)).sqrt();
-            if d > r {
-                continue;
-            }
-            let tri = x as f32 >= 11.0
-                && x as f32 <= 23.0
-                && (y as f32 - 16.0).abs() <= 7.0 - (x as f32 - 11.0) * 0.29;
-            let (r_, g_, b_) = if tri { (235, 240, 250) } else { (26, 26, 31) };
-            let i = ((y * S + x) * 4) as usize;
-            rgba[i] = r_;
-            rgba[i + 1] = g_;
-            rgba[i + 2] = b_;
-            rgba[i + 3] = 255;
+/// Window, taskbar and tray icon, taken from the executable's embedded resource
+/// (see `assets/app.rc`). Loaded at the exact pixel size for the current DPI.
+unsafe fn load_app_icon(dpi: u32, small: bool) -> HICON {
+    let (cx, cy) = unsafe {
+        if small {
+            (
+                GetSystemMetricsForDpi(SM_CXSMICON, dpi),
+                GetSystemMetricsForDpi(SM_CYSMICON, dpi),
+            )
+        } else {
+            (
+                GetSystemMetricsForDpi(SM_CXICON, dpi),
+                GetSystemMetricsForDpi(SM_CYICON, dpi),
+            )
         }
+    };
+    let Ok(module) = GetModuleHandleW(None) else {
+        return HICON::default();
+    };
+    unsafe {
+        LoadImageW(
+            Some(HINSTANCE(module.0)),
+            PCWSTR(std::ptr::without_provenance(1)),
+            IMAGE_ICON,
+            cx,
+            cy,
+            LR_DEFAULTCOLOR,
+        )
+        .map(|handle| HICON(handle.0))
+        .unwrap_or_default()
     }
-    (rgba, S, S)
 }
 
 // ---------------------------------------------------------------- window
@@ -2372,5 +2396,35 @@ mod tests {
     fn time_formatting() {
         assert_eq!(fmt_time(0.0), "0:00");
         assert_eq!(fmt_time(65.9), "1:05");
+    }
+
+    fn track(path: &str) -> Track {
+        Track {
+            path: PathBuf::from(path),
+            title: path.into(),
+            artist: String::new(),
+            duration: 0.0,
+            stamp: 1,
+        }
+    }
+
+    #[test]
+    fn rescan_remaps_current_and_queue_by_path() {
+        let old = vec![
+            track("a.flac"),
+            track("b.flac"),
+            track("c.flac"),
+            track("d.flac"),
+        ];
+        // "a" was deleted, the rest re-sorted.
+        let new = vec![track("d.flac"), track("b.flac"), track("c.flac")];
+        let queue: VecDeque<usize> = [2usize, 3, 0].into_iter().collect();
+
+        let (current, queue) = remap_after_scan(&old, &new, Some(1), &queue);
+        assert_eq!(current, Some(1)); // b stays b
+        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec![2, 0]);
+
+        let (lost, _) = remap_after_scan(&old, &new, Some(0), &VecDeque::new());
+        assert_eq!(lost, None); // a is gone
     }
 }
