@@ -4,6 +4,8 @@ A tiny music player for local files on Windows. Nothing extra.
 
 **English** · [Русский](README.ru.md)
 
+![Just Music playing a track](assets/screenshot.png)
+
 ## Download
 
 `just_music.exe` is in the [latest release](../../releases/latest). No installer, no runtime.

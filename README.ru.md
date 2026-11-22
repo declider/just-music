@@ -4,6 +4,8 @@
 
 [English](README.md) · **Русский**
 
+![Just Music играет трек](assets/screenshot.png)
+
 ## Скачать
 
 `just_music.exe` лежит в [последнем релизе](../../releases/latest). Без установщика и без рантайма.
