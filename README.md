@@ -20,7 +20,11 @@ Run `just_music.exe <folder>` to open a folder at startup (otherwise use the fol
 
 ## Settings
 
-One file: `%APPDATA%\JustMusic\settings.ini` — last folder, volume, shuffle.
+One file: `%APPDATA%\JustMusic\settings.ini` — last folder, volume, shuffle. The library scan cache lives next to it in `library.cache`.
+
+## Uninstall
+
+Delete `just_music.exe` and the `%APPDATA%\JustMusic` folder.
 
 ## Author
 

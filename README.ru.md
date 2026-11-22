@@ -20,7 +20,11 @@ cargo build --release
 
 ## Настройки
 
-Один файл: `%APPDATA%\JustMusic\settings.ini` — последняя папка, громкость, shuffle.
+Один файл: `%APPDATA%\JustMusic\settings.ini` — последняя папка, громкость, shuffle. Рядом лежит кэш просканированной библиотеки — `library.cache`.
+
+## Удаление
+
+Удалите `just_music.exe` и папку `%APPDATA%\JustMusic`.
 
 ## Автор
 
