@@ -1083,6 +1083,11 @@ impl App {
         let Some((rgba, w, h)) = library::cover_rgba(&track.path) else {
             return;
         };
+        // The DIB wants BGRA, the decoder gives RGBA.
+        let mut bgra = rgba;
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
 
         unsafe {
             let mut bmi = BITMAPINFO::default();
@@ -1097,7 +1102,7 @@ impl App {
             let Ok(bmp) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
                 return;
             };
-            std::ptr::copy_nonoverlapping(rgba.as_ptr(), bits as *mut u8, rgba.len());
+            std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
             self.cover = Some(Cover {
                 bmp,
                 w: w as i32,
