@@ -1085,7 +1085,7 @@ impl App {
         };
         // The DIB wants BGRA, the decoder gives RGBA.
         let mut bgra = rgba;
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
 
