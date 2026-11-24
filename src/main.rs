@@ -407,7 +407,7 @@ impl Layout {
             (header_h + search_h) / 2,
         );
 
-        let bar_top = (h - bar_h).max(header_h + s(4.0));
+        let bar_top = (h - bar_h).max(header_h);
         let bar = rect(0, bar_top, w, h);
         let list = rect(pad, header_h + s(4.0), w - pad, bar_top);
 
@@ -2271,9 +2271,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         if lp.0 != 0 {
                             let info = &mut *(lp.0 as *mut MINMAXINFO);
                             info.ptMinTrackSize.x = (400.0 * app.scale()) as i32;
-                            // Header (36) + gap (4) + player bar (80): the list can
-                            // disappear entirely, leaving just controls and transport.
-                            info.ptMinTrackSize.y = (120.0 * app.scale()) as i32;
+                            // Header (36) + player bar (80): the list can disappear
+                            // entirely, leaving just controls and transport.
+                            info.ptMinTrackSize.y = (116.0 * app.scale()) as i32;
                         }
                         LRESULT(0)
                     }
