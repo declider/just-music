@@ -71,15 +71,30 @@ fn file_stamp(path: &Path) -> u64 {
 /// while a big folder is being indexed on another thread. Tracks whose stamp
 /// still matches a cached entry are taken from `reuse` instead of being re-read.
 pub fn scan(dir: &Path, out: &mut Vec<Track>, reuse: &mut HashMap<PathBuf, Track>, count: &AtomicUsize) {
+    scan_dir(dir, out, reuse, count, 0);
+}
+
+fn scan_dir(
+    dir: &Path,
+    out: &mut Vec<Track>,
+    reuse: &mut HashMap<PathBuf, Track>,
+    count: &AtomicUsize,
+    depth: u32,
+) {
+    // ponytail: depth cap keeps junction/symlink loops from overflowing the
+    // stack; dedupe by canonical path if a real tree needs more than 64 levels.
+    if depth > 64 {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan(&path, out, reuse, count);
+            scan_dir(&path, out, reuse, count, depth + 1);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && AUDIO_EXT.contains(&ext.to_ascii_lowercase().as_str())
+            && AUDIO_EXT.iter().any(|audio| ext.eq_ignore_ascii_case(audio))
         {
             let track = match reuse.get(&path) {
                 Some(old) if old.stamp == file_stamp(&path) => old.clone(),
@@ -91,8 +106,11 @@ pub fn scan(dir: &Path, out: &mut Vec<Track>, reuse: &mut HashMap<PathBuf, Track
     }
 }
 
+/// RGBA pixels plus their dimensions.
+pub type CoverImage = (Vec<u8>, u32, u32);
+
 /// RGBA thumbnail of the embedded cover, if any.
-pub fn cover_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+pub fn cover_rgba(path: &Path) -> Option<CoverImage> {
     let file = lofty::read_from_path(path).ok()?;
     let pic = file
         .primary_tag()
@@ -101,7 +119,8 @@ pub fn cover_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
         .first()?;
     let img = image::load_from_memory(pic.data())
         .ok()?
-        .thumbnail(96, 96)
+        // The UI draws a square; cropping to fill beats stretching the art.
+        .resize_to_fill(160, 160, image::imageops::FilterType::Triangle)
         .to_rgba8();
     let (w, h) = img.dimensions();
     Some((img.into_raw(), w, h))
@@ -145,7 +164,12 @@ impl Settings {
                 _ => {}
             }
         }
-        s.volume = s.volume.clamp(0.0, 1.0);
+        // A hand-edited "NaN" would otherwise poison the mixer.
+        s.volume = if s.volume.is_finite() {
+            s.volume.clamp(0.0, 1.0)
+        } else {
+            Self::default().volume
+        };
         s
     }
 
@@ -233,7 +257,8 @@ fn read_cache(path: &Path, folder: &Path) -> Vec<Track> {
         .filter_map(|line| {
             let mut f = line.split('\t');
             let stamp = u64::from_str_radix(f.next()?, 16).ok()?;
-            let duration = f.next()?.parse().ok()?;
+            // Duration feeds `Duration::from_secs_f64`, which panics on NaN/inf.
+            let duration = f.next()?.parse().ok().filter(|d: &f64| d.is_finite())?;
             let path = PathBuf::from(unesc(f.next()?));
             let title = unesc(f.next()?);
             let artist = unesc(f.next()?);
@@ -306,12 +331,17 @@ mod tests {
         let tracks = vec![
             track("D:\\Music\\a.mp3", "A\tB", "C\\D"),
             track("D:\\Music\\b.mp3", "line\nbreak", ""),
+            Track {
+                duration: f64::NAN,
+                ..track("D:\\Music\\c.mp3", "broken", "")
+            },
         ];
         write_cache(&file, folder, &tracks);
         let back = read_cache(&file, folder);
         let wrong_folder = read_cache(&file, Path::new("D:\\Other"));
         let _ = std::fs::remove_file(&file);
 
+        // The NaN-duration entry is dropped rather than trusted.
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].path, tracks[0].path);
         assert_eq!(back[0].title, "A\tB");

@@ -14,7 +14,7 @@ use std::{
     ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
     time::Duration,
@@ -77,6 +77,10 @@ const ERROR_RED: COLORREF = COLORREF(0x0068_7cff);
 const WM_TRAY: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
 
+/// "TaskbarCreated" broadcast id, filled in at startup. Explorer sends it after
+/// a restart, which is when the tray icon has to be added back.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
 const CMD_PLAY: usize = 100;
 const CMD_PREV: usize = 101;
 const CMD_NEXT: usize = 102;
@@ -126,6 +130,16 @@ impl Fonts {
             ui: make(14, 400, w_ptr("Segoe UI")),
             small: make(11, 400, w_ptr("Segoe UI")),
             icons: make(18, 400, w_ptr("Segoe MDL2 Assets")),
+        }
+    }
+}
+
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.ui.0));
+            let _ = DeleteObject(HGDIOBJ(self.small.0));
+            let _ = DeleteObject(HGDIOBJ(self.icons.0));
         }
     }
 }
@@ -542,6 +556,14 @@ struct Cover {
     h: i32,
 }
 
+impl Drop for Cover {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(self.bmp.0));
+        }
+    }
+}
+
 struct App {
     hwnd: HWND,
     edit: HWND,
@@ -578,6 +600,8 @@ struct App {
     pct_w: i32,
 
     cover: Option<Cover>,
+    /// Cover decode running on a worker thread, tagged with the track's path.
+    cover_rx: Option<(PathBuf, Receiver<Option<library::CoverImage>>)>,
     rng: u64,
     dpi_scale: f32,
     knob: Disc,
@@ -627,6 +651,7 @@ impl App {
             tot_w: 0,
             pct_w: 0,
             cover: None,
+            cover_rx: None,
             rng: seed(),
             dpi_scale: dpi,
             knob: unsafe { Disc::new((9.0 * dpi).round() as i32) },
@@ -712,7 +737,7 @@ impl App {
                 Some(WPARAM(0)),
                 Some(LPARAM(w_ptr("Search title or artist").0 as isize)),
             );
-            SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(256)), Some(LPARAM(0)));
+            SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(255)), Some(LPARAM(0)));
             // Empty and unfocused: the window paints the faded placeholder instead.
             let _ = ShowWindow(edit, SW_HIDE);
         }
@@ -752,6 +777,58 @@ impl App {
             let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         }
         self.tray = false;
+    }
+
+    /// Rebuilds every DPI-dependent resource after the window lands on a
+    /// monitor with a different scale factor.
+    unsafe fn apply_dpi(&mut self, dpi: f32) {
+        self.dpi_scale = dpi;
+        let px = (96.0 * dpi) as i32;
+        unsafe {
+            self.fonts = Fonts::new(px); // old handles freed by Fonts::drop
+            self.knob = Disc::new((9.0 * dpi).round() as i32);
+            self.knob_hot = Disc::new((11.0 * dpi).round() as i32);
+
+            if !self.edit.is_invalid() {
+                SendMessageW(
+                    self.edit,
+                    WM_SETFONT,
+                    Some(WPARAM(self.fonts.ui.0 as isize as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+
+            for (small, icon) in [(false, &mut self.icon), (true, &mut self.icon_small)] {
+                let fresh = load_app_icon(px as u32, small);
+                if fresh.is_invalid() {
+                    continue;
+                }
+                let old = std::mem::replace(icon, fresh);
+                if !old.is_invalid() {
+                    let _ = DestroyIcon(old);
+                }
+            }
+            if !self.icon.is_invalid() {
+                SendMessageW(
+                    self.hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_BIG as usize)),
+                    Some(LPARAM(self.icon.0 as isize)),
+                );
+            }
+            if !self.icon_small.is_invalid() {
+                SendMessageW(
+                    self.hwnd,
+                    WM_SETICON,
+                    Some(WPARAM(ICON_SMALL as usize)),
+                    Some(LPARAM(self.icon_small.0 as isize)),
+                );
+            }
+
+            self.remove_tray();
+            self.init_tray(self.hwnd);
+        }
+        self.invalidate();
     }
 
     fn scale(&self) -> f32 {
@@ -808,6 +885,13 @@ impl App {
     // ------------------------------------------------ library / playback
 
     fn load_folder(&mut self, dir: PathBuf) {
+        if self.folder.as_deref() == Some(dir.as_path()) {
+            // Same folder picked again: refresh in place and keep playing.
+            self.start_scan();
+            self.invalidate();
+            return;
+        }
+
         self.folder = Some(dir.clone());
         self.tracks.clear();
         self.visible.clear();
@@ -816,6 +900,8 @@ impl App {
         self.playing = false;
         self.pos = 0.0;
         self.queue.clear();
+        self.cover = None;
+        self.cover_rx = None;
         if let Some(audio) = &self.audio {
             audio.stop();
         }
@@ -824,6 +910,17 @@ impl App {
         // only re-reads files that changed on disk.
         self.tracks = library::load_cache(&dir);
         self.refilter();
+        self.start_scan();
+        self.save_settings();
+        self.invalidate();
+    }
+
+    /// Indexes `self.folder` on a worker thread, reusing cached tags for files
+    /// whose mtime/size did not change.
+    fn start_scan(&mut self) {
+        let Some(dir) = self.folder.clone() else {
+            return;
+        };
         let mut reuse: HashMap<PathBuf, Track> = self
             .tracks
             .iter()
@@ -837,18 +934,11 @@ impl App {
         std::thread::spawn(move || {
             let mut tracks = Vec::new();
             library::scan(&dir, &mut tracks, &mut reuse, &thread_count);
-            tracks.sort_by(|a, b| {
-                a.title
-                    .to_lowercase()
-                    .cmp(&b.title.to_lowercase())
-                    .then_with(|| a.artist.to_lowercase().cmp(&b.artist.to_lowercase()))
-            });
+            tracks.sort_by_cached_key(|t| (t.title.to_lowercase(), t.artist.to_lowercase()));
             let _ = tx.send(tracks);
         });
         self.scan = Some(Scan { rx, count });
         self.scan_count = self.tracks.len();
-        self.save_settings();
-        self.invalidate();
     }
 
     fn poll_scan(&mut self) {
@@ -895,6 +985,8 @@ impl App {
             }
             self.playing = false;
             self.pos = 0.0;
+            self.cover = None;
+            self.cover_rx = None;
         }
 
         self.refilter();
@@ -929,6 +1021,13 @@ impl App {
         let title = track.title.clone();
         let artist = track.artist.clone();
 
+        if self.audio.is_none() {
+            // A device may show up after startup (headset plugged in, driver reload).
+            self.audio = Audio::open().ok();
+            if let Some(audio) = &self.audio {
+                audio.set_volume(self.volume);
+            }
+        }
         let Some(audio) = &self.audio else {
             self.error = Some("No audio output device".into());
             return;
@@ -940,9 +1039,7 @@ impl App {
                 self.playing = true;
                 self.marquee = 0;
                 self.error = None;
-                unsafe {
-                    self.load_cover();
-                }
+                self.start_cover(idx);
                 self.scroll_to_current();
                 unsafe {
                     let text = if artist.is_empty() {
@@ -956,6 +1053,8 @@ impl App {
             Err(e) => {
                 self.current = None;
                 self.playing = false;
+                self.cover = None;
+                self.cover_rx = None;
                 self.error = Some(format!("{title}: {e}"));
             }
         }
@@ -1020,13 +1119,17 @@ impl App {
             audio.pause();
         }
         self.playing = !audio.is_paused();
+        self.marquee = 0; // restart long titles from the beginning
         self.invalidate();
     }
 
     fn seek_to(&mut self, secs: f64) {
+        // `Duration::from_secs_f64` panics on NaN/inf, and the position can come
+        // from a broken tag or a drag.
+        let secs = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
         self.pos = secs;
         if let Some(audio) = &self.audio {
-            audio.seek(Duration::from_secs_f64(secs.max(0.0)));
+            audio.seek(Duration::from_secs_f64(secs));
         }
         self.invalidate();
     }
@@ -1062,6 +1165,13 @@ impl App {
         }
     }
 
+    /// Keeps the scroll offset inside the list after the window grows.
+    fn clamp_scroll(&mut self) {
+        let l = self.layout();
+        let rows = ((l.list.bottom - l.list.top) / l.row_h).max(1) as usize;
+        self.scroll = self.scroll.min(self.visible.len().saturating_sub(rows));
+    }
+
     fn rng_next(&mut self) -> u64 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -1071,18 +1181,47 @@ impl App {
         x
     }
 
-    unsafe fn load_cover(&mut self) {
-        if let Some(old) = self.cover.take() {
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(old.bmp.0));
+    /// Decodes the cover on a worker thread: a full-size embedded scan can take
+    /// hundreds of milliseconds, far too long to block the UI thread on.
+    fn start_cover(&mut self, idx: usize) {
+        self.cover = None;
+        self.cover_rx = None;
+        let Some(path) = self.tracks.get(idx).map(|t| t.path.clone()) else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(library::cover_rgba(&thread_path));
+        });
+        self.cover_rx = Some((path, rx));
+        self.invalidate();
+    }
+
+    fn poll_cover(&mut self) {
+        let Some((path, rx)) = self.cover_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some((rgba, w, h))) => {
+                let still_current = self
+                    .current
+                    .and_then(|i| self.tracks.get(i))
+                    .is_some_and(|t| t.path == path);
+                if still_current {
+                    unsafe {
+                        self.set_cover(rgba, w, h);
+                    }
+                    self.invalidate();
+                }
             }
+            Ok(None) => {} // no embedded art; the placeholder is already drawn
+            Err(TryRecvError::Empty) => self.cover_rx = Some((path, rx)),
+            Err(TryRecvError::Disconnected) => {}
         }
-        let Some(track) = self.current.and_then(|i| self.tracks.get(i)) else {
-            return;
-        };
-        let Some((rgba, w, h)) = library::cover_rgba(&track.path) else {
-            return;
-        };
+    }
+
+    unsafe fn set_cover(&mut self, rgba: Vec<u8>, w: u32, h: u32) {
         // The DIB wants BGRA, the decoder gives RGBA.
         let mut bgra = rgba;
         for px in bgra.as_chunks_mut::<4>().0 {
@@ -1114,6 +1253,7 @@ impl App {
     fn tick(&mut self) {
         self.marquee = self.marquee.wrapping_add(1);
         self.poll_scan();
+        self.poll_cover();
 
         let finished = self.current.is_some() && self.audio.as_ref().is_some_and(|a| a.finished());
         if finished {
@@ -1924,8 +2064,10 @@ impl App {
             }
 
             if total == 0 {
-                let text = if self.tracks.is_empty() && self.scan.is_some() {
-                    format!("Scanning… {} files", self.scan_count)
+                // With no library at all this is the "get started" line; a
+                // non-matching search keeps "No matches".
+                let text = if self.tracks.is_empty() {
+                    self.placeholder().0
                 } else {
                     "No matches".to_string()
                 };
@@ -1969,12 +2111,7 @@ impl Drop for App {
                 let _ = DeleteObject(HGDIOBJ(self.buf_bmp.0));
                 let _ = DeleteDC(self.buf_dc);
             }
-            if let Some(cover) = self.cover.take() {
-                let _ = DeleteObject(HGDIOBJ(cover.bmp.0));
-            }
-            let _ = DeleteObject(HGDIOBJ(self.fonts.ui.0));
-            let _ = DeleteObject(HGDIOBJ(self.fonts.small.0));
-            let _ = DeleteObject(HGDIOBJ(self.fonts.icons.0));
+            self.cover = None; // Cover::drop releases the bitmap
             let _ = DeleteObject(HGDIOBJ(self.brush_input.0));
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
@@ -2153,6 +2290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         let w = (edit.right - edit.left).max(10);
                         let h = (edit.bottom - edit.top).max(10);
                         let _ = MoveWindow(app.edit, edit.left, edit.top, w, h, true);
+                        app.clamp_scroll();
                         // Vertically centre the single-line edit text.
                         let mut fmt = rect(0, ((24.0 - 14.0) * app.scale() / 2.0) as i32, w, h);
                         SendMessageW(
@@ -2162,6 +2300,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                             Some(LPARAM(&mut fmt as *mut RECT as isize)),
                         );
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                        LRESULT(0)
+                    }
+                    WM_DPICHANGED => {
+                        let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+                        app.apply_dpi(dpi);
+                        if lp.0 != 0 {
+                            // Windows suggests the rect that keeps the window
+                            // at the same logical size on the new monitor.
+                            let r = &*(lp.0 as *const RECT);
+                            let _ = SetWindowPos(
+                                hwnd,
+                                None,
+                                r.left,
+                                r.top,
+                                r.right - r.left,
+                                r.bottom - r.top,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            );
+                        }
                         LRESULT(0)
                     }
                     WM_NCCALCSIZE => {
@@ -2262,9 +2419,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         LRESULT(0)
                     }
                     WM_CLOSE => {
-                        // Closing hides to tray; exit lives in the tray menu.
-                        let _ = ShowWindow(hwnd, SW_HIDE);
-                        trim_working_set();
+                        // Closing hides to tray; without a tray icon hiding
+                        // would leave the app unreachable, so exit instead.
+                        if app.tray {
+                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            trim_working_set();
+                        } else {
+                            let _ = DestroyWindow(hwnd);
+                        }
                         LRESULT(0)
                     }
                     WM_GETMINMAXINFO => {
@@ -2292,6 +2454,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     // Borderless: never let the default paint a frame on activation.
                     WM_NCACTIVATE => LRESULT(1),
                     WM_NCPAINT => LRESULT(0),
+                    // Explorer restarted: it broadcasts this so apps re-add their
+                    // tray icons, which otherwise disappear for good.
+                    msg if msg == TASKBAR_CREATED.load(Ordering::Relaxed) && msg != 0 => {
+                        app.remove_tray();
+                        app.init_tray(hwnd);
+                        LRESULT(0)
+                    }
                     _ => DefWindowProcW(hwnd, msg, wp, lp),
                 }
             }
@@ -2305,6 +2474,7 @@ fn main() -> windows::core::Result<()> {
 
         let instance = GetModuleHandleW(None)?;
         let class_name = w_ptr("JustMusicWindow");
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w_ptr("TaskbarCreated")), Ordering::Relaxed);
 
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
@@ -2333,7 +2503,10 @@ fn main() -> windows::core::Result<()> {
             None,
         )?;
 
-        // Popup windows ignore CW_USEDEFAULT; centre inside the work area instead.
+        // Popup windows ignore CW_USEDEFAULT; centre inside the work area instead,
+        // at the default 420×610 logical size for this monitor's DPI.
+        let dpi = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
+        let (w, h) = ((420.0 * dpi) as i32, (610.0 * dpi) as i32);
         let mut work = RECT::default();
         let _ = SystemParametersInfoW(
             SPI_GETWORKAREA,
@@ -2344,11 +2517,11 @@ fn main() -> windows::core::Result<()> {
         let _ = SetWindowPos(
             hwnd,
             None,
-            work.left + (work.right - work.left - 420) / 2,
-            work.top + (work.bottom - work.top - 610) / 2,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            work.left + (work.right - work.left - w) / 2,
+            work.top + (work.bottom - work.top - h) / 2,
+            w,
+            h,
+            SWP_NOZORDER | SWP_NOACTIVATE,
         );
 
         let _ = ShowWindow(hwnd, SW_SHOW);
